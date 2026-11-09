@@ -14,7 +14,8 @@
     "extensions": ["./src/index.ts"]
   },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "bench": "bun scripts/bench.ts"
   },
   "dependencies": {
     "@anush008/tokenizers": "0.6.0",
