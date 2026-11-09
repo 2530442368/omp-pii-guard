@@ -1,0 +1,23 @@
+{
+  "name": "omp-pii-guard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "omp extension: reversible PII masking with the local AstrLink Guard model",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2530442368/omp-pii-guard.git"
+  },
+  "homepage": "https://github.com/2530442368/omp-pii-guard",
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@anush008/tokenizers": "0.6.0",
+    "onnxruntime-node": "1.31.1"
+  }
+}

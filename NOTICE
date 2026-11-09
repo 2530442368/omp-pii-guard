@@ -1,0 +1,84 @@
+本项目的模型结果误报过滤（src/filters.ts、zhname.ts、known.ts、email.ts、packages.ts、ids.ts、
+thingname.ts、text.ts）和数据表（src/zhdata.ts、src/tlds.ts）移植或派生自下列第三方项目。
+Portions of this project are derived from the following third-party work.
+
+------------------------------------------------------------------------
+magpie
+------------------------------------------------------------------------
+
+What:     internal/redact/{model,zhname,known,ids,thingname,email,packages 等}.go
+          及其测试，移植为 TypeScript（偏移改为 UTF-16 码元）。
+Upstream: https://github.com/yetone/magpie，移植自 commit 16e79fc
+License:  MIT
+
+MIT License
+
+Copyright (c) 2026 yetone
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------
+jieba's dictionary (a word list)
+------------------------------------------------------------------------
+
+What:     src/zhdata.ts 里的 ZH_DICT_WORDS，约 1,550 个以姓氏开头的常见两字中文词，
+          用来避免把它们当成人名遮掉。经 magpie 的 internal/redact/zhdict.txt 取自
+          jieba 的 dict.txt。
+Upstream: jieba v0.42.1, https://github.com/fxsjy/jieba
+License:  MIT
+
+The MIT License (MIT)
+
+Copyright (c) 2013 Sun Junyi
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
+Public Suffix List（顶级域表）
+------------------------------------------------------------------------
+
+What:     src/tlds.ts 里的 ICANN_TLDS，由 golang.org/x/net v0.56.0 的 publicsuffix
+          包（与 magpie 判断“是否真实邮箱域名”所用的同一份数据）机械导出，共 1442 项。
+Upstream: https://publicsuffix.org/ （Public Suffix List，MPL-2.0）
+          https://pkg.go.dev/golang.org/x/net/publicsuffix （BSD-3-Clause）
+          数据文件的许可见 https://mozilla.org/MPL/2.0/ ，包装代码的许可见
+          https://github.com/golang/net/blob/master/LICENSE 。
+
+------------------------------------------------------------------------
+AstrLink Guard
+------------------------------------------------------------------------
+
+本项目的过滤只处理 AstrLink Guard 模型输出的标签（private_person、private_address、phone、
+email、account、payment_card、common_secret 等），不含模型权重和代码。
+模型本身以 Apache-2.0 许可发布，使用与再分发请遵循其许可。
