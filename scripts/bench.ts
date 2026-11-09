@@ -27,7 +27,7 @@ import { AstrGuard, Limiter, type Recognizer } from "../src/guard.ts";
 import { knownSpans } from "../src/known.ts";
 import { Masker } from "../src/mask.ts";
 import { maskPayload } from "../src/payload.ts";
-import { Placeholders } from "../src/placeholder.ts";
+import { PH_RE, Placeholders } from "../src/placeholder.ts";
 import type { Kind, RawFind, Span } from "../src/types.ts";
 import { annotated, background, jsonToolOutput, rng, type Lang } from "./bench-corpus.ts";
 
@@ -50,7 +50,12 @@ function modelDir(): string {
 // ---- 小工具 ---------------------------------------------------------------------------------------
 
 const kb = (texts: readonly string[]): number => texts.reduce((n, t) => n + Buffer.byteLength(t), 0) / 1024;
-const median = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.floor((xs.length - 1) / 2)]!;
+/** 中位数：偶数个样本取中间两项的平均。 */
+const median = (xs: number[]): number => {
+  const v = [...xs].sort((a, b) => a - b);
+  const mid = v.length >> 1;
+  return v.length % 2 === 1 ? v[mid]! : (v[mid - 1]! + v[mid]!) / 2;
+};
 const p95 = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.ceil(xs.length * 0.95) - 1)]!;
 const f = (x: number, d = 1): string => x.toFixed(d);
 const pct = (a: number, b: number): string => (b === 0 ? "n/a" : `${((a / b) * 100).toFixed(1)}%`);
@@ -504,43 +509,69 @@ async function codeEffect(name: string, docs: Doc[], guard: AstrGuard, publicCor
   const finds = await inferAll(guard, docs.map((d) => d.text));
   const inferMs = performance.now() - t0;
   const modules = moduleNames(docs);
+  // 口径一：模型区间经阈值与误报过滤后的数量（不含已知值补遮）
+  const modelKinds: Record<string, number> = {};
+  for (const d of docs) for (const sp of spansOf(d.text, finds.get(d.text)!)) modelKinds[sp.kind] = (modelKinds[sp.kind] ?? 0) + 1;
+  const modelTotal = Object.values(modelKinds).reduce((x, y) => x + y, 0);
+
+  // 口径二：整条管线（含已知值补遮）实际替换的区间。从输出里的占位符还原出每处替换的原值与位置，
+  // 并用“把占位符换回原值后与原文逐字相同”校验对齐；对不上的文档单独计数。
+  const masker = newMasker(replay(finds));
+  const outs = await masker.maskTexts(docs.map((d) => ({ text: d.text, args: false })));
   const byKind: Record<string, number> = {};
   const hits: { src: string; line: number; kind: Kind; shape: string; value?: string }[] = [];
   let snake = 0;
   let moduleHit = 0;
   let identLike = 0;
-  for (const d of docs) {
-    for (const s of spansOf(d.text, finds.get(d.text)!)) {
-      const v = d.text.slice(s.start, s.end);
-      byKind[s.kind] = (byKind[s.kind] ?? 0) + 1;
-      if (SNAKE.test(v)) snake++;
-      if (modules.has(v)) moduleHit++;
-      if (IDENT.test(v)) identLike++;
-      hits.push({ src: d.src, line: lineOf(d.text, s.start), kind: s.kind, shape: shape(v).slice(0, 32), ...(publicCorpus ? { value: v.slice(0, 80) } : {}) });
+  let unaligned = 0;
+  docs.forEach((d, i) => {
+    const o = outs[i]!;
+    let at = 0;
+    let rebuilt = "";
+    const found: { start: number; kind: Kind; v: string }[] = [];
+    let last = 0;
+    for (const m of o.matchAll(PH_RE)) {
+      const v = masker.ph.lookup(m[0]);
+      if (v === undefined) continue;
+      rebuilt += o.slice(last, m.index);
+      at += m.index! - last;
+      found.push({ start: at, kind: m[1] as Kind, v });
+      rebuilt += v;
+      at += v.length;
+      last = m.index! + m[0].length;
     }
-  }
-  const masker = newMasker(replay(finds));
-  const replaced: Record<string, number> = {};
-  await masker.maskTexts(docs.map((d) => ({ text: d.text, args: false })), { onTag: (k) => void (replaced[k] = (replaced[k] ?? 0) + 1) });
+    rebuilt += o.slice(last);
+    if (rebuilt !== d.text) {
+      unaligned++;
+      return;
+    }
+    for (const h of found) {
+      byKind[h.kind] = (byKind[h.kind] ?? 0) + 1;
+      if (SNAKE.test(h.v)) snake++;
+      if (modules.has(h.v)) moduleHit++;
+      if (IDENT.test(h.v)) identLike++;
+      hits.push({ src: d.src, line: lineOf(d.text, h.start), kind: h.kind, shape: shape(h.v).slice(0, 32), ...(publicCorpus ? { value: h.v.slice(0, 80) } : {}) });
+    }
+  });
   const total = Object.values(byKind).reduce((a, b) => a + b, 0);
   const size = kb(docs.map((d) => d.text));
   heading(`${name}: ${docs.length} files, ${size.toFixed(0)} KB`);
   console.log(
     table(
-      ["Masked spans (after filters)", "By kind", "Whole pipeline replaced", "snake_case values masked", "import/package names masked", "Identifier-shaped spans", "Inference ms/KB"],
-      [[total, Object.entries(byKind).map(([k, v]) => `${k} ${v}`).join(", ") || "none", Object.values(replaced).reduce((a, b) => a + b, 0), snake, moduleHit, identLike, f(inferMs / size)]],
+      ["Model spans after filters", "Whole pipeline replaced (incl. known-value pass)", "Pipeline, by kind", "snake_case values replaced", "import/package names replaced", "Identifier-shaped values replaced", "Inference ms/KB"],
+      [[modelTotal, total, Object.entries(byKind).map(([k, v]) => `${k} ${v}`).join(", ") || "none", snake, moduleHit, identLike, f(inferMs / size)]],
     ),
   );
-  console.log(`\n(${modules.size} import/package names collected from the same files for the check.)`);
+  console.log(`\n(${modules.size} import/package names collected from the same files for the check; model spans by kind: ${Object.entries(modelKinds).map(([k, v]) => `${k} ${v}`).join(", ") || "none"}; ${unaligned} files could not be aligned and are left out of the pipeline detail.)`);
   if (publicCorpus && hits.length > 0) {
-    console.log("\nMasked spans (public sources; value truncated to 80 chars):\n");
+    console.log("\nSpans replaced by the whole pipeline (public sources; value truncated to 80 chars):\n");
     console.log(table(["File:line", "Kind", "Value"], hits.map((h) => [`${h.src}:${h.line}`, h.kind, `\`${(h.value ?? "").replace(/\|/g, "\\|").replace(/\n/g, "⏎")}\``])));
   } else if (hits.length > 0) {
     const shapes = new Map<string, number>();
     for (const h of hits) shapes.set(`${h.kind} ${h.shape}`, (shapes.get(`${h.kind} ${h.shape}`) ?? 0) + 1);
     console.log(`\nShapes (private corpus, no values): ${[...shapes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([s, n]) => `${s}×${n}`).join("  ")}`);
   }
-  return { files: docs.length, kb: size, inferMsPerKB: inferMs / size, maskedByKind: byKind, maskedTotal: total, pipelineReplaced: replaced, snakeCaseMasked: snake, moduleNamesMasked: moduleHit, identifierShaped: identLike, moduleNamesCollected: modules.size, hits };
+  return { files: docs.length, kb: size, inferMsPerKB: inferMs / size, modelSpansByKind: modelKinds, modelSpansTotal: modelTotal, pipelineReplacedByKind: byKind, pipelineReplacedTotal: total, unalignedFiles: unaligned, snakeCaseMasked: snake, moduleNamesMasked: moduleHit, identifierShaped: identLike, moduleNamesCollected: modules.size, hits };
 }
 
 // ---- 主流程 ---------------------------------------------------------------------------------------

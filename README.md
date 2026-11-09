@@ -2,11 +2,11 @@
 
 # omp-pii-guard
 
-### Keep names, addresses, phones, emails, accounts and passwords out of every prompt.
+### Find and mask names, addresses, phones, emails, accounts and passwords before a prompt leaves your machine.
 
 **An [omp](https://github.com/can1357/oh-my-pi) extension that masks personal data with a local model before a request leaves your machine,<br>
 and puts the real values back in the reply.**<br>
-A 37 MB int8 model on the CPU, no network call at run time, and a request that can't be masked is never sent.
+A 37 MB int8 model on the CPU, no network call of its own at run time, and a request it fails to process is not sent. Recognition is best effort, not a guarantee: see [what fail-closed covers](#fail-closed-and-no-retry-storm) and [How well it finds things](#how-well-it-finds-things).
 
 [![License](https://img.shields.io/badge/license-MIT-111111)](LICENSE) ![omp](https://img.shields.io/badge/omp-18.18.x-111111) ![macOS arm64](https://img.shields.io/badge/macOS-arm64%20verified-000000?logo=apple&logoColor=white) ![Model](https://img.shields.io/badge/model-AstrLink%20Guard%20int8-111111)
 
@@ -22,8 +22,10 @@ An agent puts everything it reads into the prompt: a customer's name in a log, a
 
 - **Mask six kinds of personal data**: person names, addresses, phone numbers, emails, accounts (bank and card numbers) and passwords. A local model finds them; filters ported from [magpie](https://github.com/yetone/magpie) keep code identifiers, module names and package names from being mistaken for them.
 - **Get the real values back**: the model answers with placeholders such as `{{PERSON_k3v9x2mq}}`; tool-call arguments and assistant messages are restored on your machine, so a file the agent writes or a command it runs has the real value.
-- **Stay silent on the network**: the model runs on the CPU, locally. Only `/pii setup` ever goes online, once, to download the model files.
-- **Fail closed**: if the model is missing, recognition errors out, the format is unsupported or the time runs out, the request is not sent, and the message says why and how to turn masking off.
+- **Quiet on the network**: the model runs on the CPU, locally. The extension itself goes online only in `/pii setup`, to download the model files (your prompts still go to your model service, masked).
+- **Fail closed on errors**: if the model is missing, recognition errors out, the format is unsupported or the time runs out, the request is not sent, and the message says why and how to turn masking off.
+
+**What that does and doesn't promise.** Fail-closed covers *processing failures*. When recognition succeeds but the model or the filters don't flag a value (on the synthetic corpus below, 94.9% of planted values were fully masked, and bare account numbers in `KEY=value` lines 0 of 40), the missed value goes out as written, with no error. Treat the extension as a strong extra layer, not a guarantee, and check what matters with `PII_GUARD_NO_RESTORE=1` (see [Commands](#commands-and-switches)).
 
 It's for you if you use omp with a hosted model and the text it reads may contain people's data. If you only need API keys and tokens masked, omp's own Hide Secrets does that; the two work side by side (see [Alongside Hide Secrets](#alongside-omp-hide-secrets)).
 
@@ -124,7 +126,7 @@ The cost: the model sees `{{PERSON_…}}`, not the name, so a task about the val
 
 | | |
 | :-- | :-- |
-| **Failure means not sent** | Model unavailable, recognition error, unsupported format or timeout → the request is not sent, with the reason and how to turn masking off |
+| **Failure means not sent** | Model unavailable, recognition error, unsupported format or timeout → the request is not sent, with the reason and how to turn masking off. This is about *processing failures*: a value that recognition simply doesn't flag (see [How well it finds things](#how-well-it-finds-things)) is sent as written |
 | **Why no rejection** | omp 18.18.1 treats connection-type errors (a rejected fetch wrapped by the SDK as `Connection error.`, a closed WebSocket) as retryable and retries about 10 times; `-p` doesn't exit for 150 s or more |
 | **fetch** | Doesn't reject. Returns a synthetic **HTTP 422** (header `x-should-retry: false`, JSON error body `code: pii_guard_blocked`). 422 is outside the omp/SDK retry set and doesn't trigger the `~/.omp/logs/http-400-requests/` request dump that 400/413 do |
 | **WebSocket** | First delivers a server `error` event on the connection (`code: pii_guard_blocked`, which the codex provider turns into a non-retryable error), then closes with 1000 (normal closure) |
@@ -160,21 +162,21 @@ Startup self-check: `session_start` checks that the network-layer wrappers are s
 
 Numbers below come from `bun run bench`, one run on a real machine, not estimates. Reproduce them with the commands at the end of this section; numbers on your hardware will differ.
 
-Measured on an Apple M3 Max (14 cores, 36 GB), macOS 26.3.1 (darwin 25.3.0), omp 18.18.1 (Bun 1.4.4), onnxruntime-node 1.31.1, the pinned int8 model, **4 threads** (3 windows in flight), on 2026-11-09. The machine was not idle: other processes were running (1-minute load average between 6 and 47 during the runs), so treat small differences with care. Each timing is the median of 3 runs unless noted.
+Measured on an Apple M3 Max (14 cores, 36 GB), macOS 26.3.1 (darwin 25.3.0), omp 18.18.1 (Bun 1.4.4), onnxruntime-node 1.31.1, the pinned int8 model, **4 threads** (3 windows in flight), on 2026-11-09. The machine was not idle: other processes were running (1-minute load average between 4 and 11 during the runs), so treat small differences with care. Each timing is the median of 3 runs unless noted.
 
 ### What it costs
 
 | | |
 | :-- | :-- |
-| **Model load** | 94 / 93 / 91 / 92 ms at 1 / 2 / 4 / 8 threads, each in a fresh process (187 ms in the full run that started under a load average of 47). Includes importing onnxruntime and the tokenizer; the model files were in the OS page cache |
-| **Memory** | RSS 12 MB before load → 97 MB after load (+85 MB) → 120 MB after three warm-up inferences (+108 MB) |
-| **One 510-token window** | 48.4 ms for English prose, 46.1 ms for Chinese prose (median of 30; p95 71.2 / 62.7 ms) |
-| **Throughput, inference** | Chinese prose 30.1, English prose 26.6, code 36.2, JSON tool output 49.6 ms per KB, one document at a time |
-| **Everything after inference** | Thresholding, filters, replacement: 0.004–0.046 ms per KB, negligible next to inference |
-| **Open an old session** | Prescan of a 504 KB / 118-leaf mixed history with nothing cached: 17.7 s (17.7 / 17.8 / 17.5 s), about 35 ms per KB, in the background |
-| **Egress after prescan** | The same history, first request: 7.2 ms (spans filtered and replaced); repeated requests: 0.37 ms (median of 5), all cache hits |
-| **A new tool output** | 20.2 KB of fresh JSON tool output on top of the cached history: 1036 ms (1035 / 1036 / 1043 ms), mostly inference |
-| **Known-value pass** | 1 Mi characters × 1000 known values, 4187 hits: 26.9 ms with a fresh index (30.3 / 25.7 / 26.9 ms), 23.3 ms with the index cached |
+| **Model load** | 96 / 92 / 92 / 93 ms at 1 / 2 / 4 / 8 threads, each in a fresh process (91 ms in the full 4-thread run). Includes importing onnxruntime and the tokenizer; the model files were in the OS page cache |
+| **Memory** | RSS 11 MB before load → 94 MB after load (+83 MB) → 119 MB after three warm-up inferences (+108 MB) |
+| **One 510-token window** | 46.8 ms for English prose, 46.3 ms for Chinese prose (median of 30; p95 47.1 / 46.7 ms) |
+| **Throughput, inference** | Chinese prose 30.4, English prose 26.9, code 36.3, JSON tool output 49.9 ms per KB, one document at a time |
+| **Everything after inference** | Thresholding, filters, replacement: 0.003–0.035 ms per KB, negligible next to inference |
+| **Open an old session** | Prescan of a 504 KB / 118-leaf mixed history with nothing cached: 17.7 s (17.7 / 17.7 / 17.7 s), about 35 ms per KB, in the background |
+| **Egress after prescan** | The same history, first request: 7.6 ms (spans filtered and replaced); repeated requests: 0.37 ms (median of 5), all cache hits |
+| **A new tool output** | 20.2 KB of fresh JSON tool output on top of the cached history: 1047 ms (1044 / 1048 / 1047 ms), mostly inference |
+| **Known-value pass** | 1 Mi characters × 1000 known values, 4187 hits: 25.9 ms with a fresh index (31.1 / 24.6 / 25.9 ms), 24.5 ms with the index cached |
 
 In short: most of the time is the model, roughly 25–50 ms per KB of new text at 4 threads, so a 20 KB tool result adds about a second to its first request, and anything already seen is free.
 
@@ -186,10 +188,10 @@ Every row is a fresh process. Concurrent windows = cores / threads, as in the ex
 
 | Threads | Concurrent windows | One window, English | One window, Chinese | Chinese ms/KB | English ms/KB | Code ms/KB | JSON ms/KB | Prescan 504 KB | RSS after warm-up |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 14 | 168.8 ms | 169.9 ms | 110.1 | 96.7 | 132.2 | 183.7 | 65.5 s | 118 MB |
-| 2 | 7 | 87.3 ms | 88.1 ms | 57.6 | 50.0 | 68.5 | 96.7 | 33.5 s | 118 MB |
-| **4** | 3 | 46.7 ms | 46.1 ms | 30.0 | 26.8 | 36.2 | 50.0 | 17.7 s | 118 MB |
-| 8 | 1 | 25.5 ms | 24.7 ms | 16.6 | 14.6 | 21.1 | 28.5 | 9.8 s | 121 MB |
+| 1 | 14 | 174.5 ms | 174.6 ms | 112.6 | 99.3 | 135.4 | 186.0 | 66.2 s | 121 MB |
+| 2 | 7 | 90.8 ms | 90.5 ms | 58.8 | 51.7 | 70.2 | 96.7 | 34.4 s | 118 MB |
+| **4** | 3 | 46.8 ms | 46.5 ms | 30.4 | 26.9 | 36.2 | 50.0 | 17.7 s | 122 MB |
+| 8 | 1 | 25.3 ms | 24.8 ms | 16.4 | 14.5 | 19.9 | 27.6 | 9.9 s | 121 MB |
 
 The default is `min(4, cores/2)`; raise `threads` in [Configuration](#configuration) if you want faster scans and have the cores. (The 4-thread row comes from a separate process from the table above, hence slightly different numbers.)
 
@@ -227,12 +229,14 @@ Where the misses are:
 
 **Public code.** The same pipeline on two public corpora: the dependency sources a fresh `npm ci` puts in `node_modules` (151 `.js`/`.mjs`/`.cjs`/`.ts`/`.md` files, 659 KB, 19 packages) and this repository's `src/` (20 files, 247 KB, Chinese-commented TypeScript).
 
-| Corpus | Masked spans | By kind | snake_case values masked | import/package names masked |
-| --- | --- | --- | --- | --- |
-| `node_modules` | 6 | SECRET 1, EMAIL 2, PERSON 3 | 0 | 0 (241 names collected) |
-| `src/` | 24 | EMAIL 3, SECRET 3, ADDRESS 1, PHONE 3, ACCOUNT 1, PERSON 13 | 0 | 0 (32 names collected) |
+| Corpus | Model spans after filters | Whole pipeline replaced (incl. known-value pass) | Pipeline, by kind | snake_case values replaced | import/package names replaced | Identifier-shaped values replaced |
+| --- | --- | --- | --- | --- | --- | --- |
+| `node_modules` | 6 | 6 | SECRET 1, EMAIL 2, PERSON 3 | 0 | 0 (241 names collected) | 1 |
+| `src/` | 24 | 39 | EMAIL 3, SECRET 3, ADDRESS 1, PHONE 4, ACCOUNT 1, PERSON 27 | 0 | 0 (32 names collected) | 4 |
 
-Every one of the 30 masked spans is example data written into documentation or comments: a sample `var password = "1234567890";` in adm-zip's README, `ex@mple.com` and the names `John`, `Tiny Andrew`, `Carla Smith` in type-fest's examples, and in `src/` the sample phones, emails, names, passwords and addresses that the filter comments use (`13800138000`, `a.b@c.com`, `张伟`, `letmeinplease`, `42 Wallaby Way`…). None is a code identifier, snake_case word, module name or package name. The full list with file and line is in the benchmark output. The dependency corpus is small and mostly code with little prose, so "0 identifiers masked" says the filters hold on this sample, not on every codebase.
+Two ways of counting: "model spans" are what the model found after the threshold and the false-positive filters; "whole pipeline" is what is actually replaced, which adds the known-value pass (a value masked once is masked wherever it appears again, which is why `src/` goes from 24 to 39: the same sample names and phones recur in its comments). The conclusions below use the whole-pipeline count, 45 replaced spans in total.
+
+Every one of the 45 is example data written into documentation or comments: a sample `var password = "1234567890";` in adm-zip's README, `ex@mple.com` and the names `John`, `Tiny Andrew`, `Carla Smith` in type-fest's examples, and in `src/` the sample phones, emails, names, passwords and addresses that the filter comments use (`13800138000`, `a.b@c.com`, `张伟`, `李娜`, `letmeinplease`, `42 Wallaby Way`…). The 5 identifier-shaped ones are sample values too: `John`, `k3Xq9vB2mZ`, `letmeinplease`, `purplemonkey` and `DE89370400`. None is a snake_case word, module name or package name, so nothing in this sample was a false positive on code. The full list with file and line is in the benchmark output. The dependency corpus is small and mostly code with little prose, so "0 snake_case or module names replaced" says the filters hold on this sample, not on every codebase.
 
 ### Reproduce
 
@@ -245,7 +249,7 @@ bun run bench speed          # or: effect
 
 The model directory is taken from `PII_GUARD_MODEL_DIR`, else `<data dir>/model`, else the magpie cache; run `/pii setup` first. Other knobs: `THREADS`, `PII_BENCH_JSON=out.json` (writes the results as JSON), `PII_BENCH_SEED`, `PII_BENCH_PER_KIND`, `PII_BENCH_REPS`. The default run reads only the synthetic generator (`scripts/bench-corpus.ts`), `node_modules` and `src/`. To add your own code or omp sessions, set `PII_BENCH_DIRS` / `PII_BENCH_SESSIONS`; those are reported as counts and shapes only, never as values.
 
-**About the synthetic values.** Everything is invented and random: names are random combinations, phone numbers are random mainland-China mobile numbers or North-American `555-01xx` numbers, account numbers start with 9, card numbers use Stripe's public test range 4000 00 with a valid checksum, passwords are random 12–18 character strings of mixed case, digits and symbols and don't resemble any real key format, and email domains are made-up words under real TLDs. Domains are deliberately not `example.com/.org/.net`, `.test`, `.invalid`, `.example` or `localhost`, because the email filter lets those through as fake addresses and the recall would no longer measure real-looking emails. Random values can coincide with real ones by chance; nothing was ever called, paid to, mailed or visited.
+**About the synthetic values.** Everything is invented and random: names are random combinations, phone numbers are random mainland-China mobile numbers or North-American `555-01xx` numbers, account numbers start with 9, card numbers are random 16-digit numbers with the prefix 4000 00 and a valid Luhn checksum (not any real card), passwords are random 12–18 character strings of mixed case, digits and symbols and don't resemble any real key format, and email domains are made-up words under real TLDs. Domains are deliberately not `example.com/.org/.net`, `.test`, `.invalid`, `.example` or `localhost`, because the email filter lets those through as fake addresses and the recall would no longer measure real-looking emails. Random values can coincide with real ones by chance; nothing was ever called, paid to, mailed or visited.
 
 ## Configuration
 
