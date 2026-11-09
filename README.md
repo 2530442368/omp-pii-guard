@@ -16,6 +16,12 @@ A 37 MB int8 model on the CPU, no network call of its own at run time, and a req
 
 <br>
 
+<div align="center">
+<img src="docs/demo/demo.en.gif" width="900" alt="Terminal recording: omp with pii-guard on the left, a local mock server on the right. A prompt with a name, phone, email and address goes out; the mock server receives only placeholders such as {{PERSON_…}}; omp shows the reply with the real values restored; /pii prints the status line.">
+</div>
+
+<sub>Left: a real omp 18.18.1 session with this extension and the real model. Right: what a local mock server (127.0.0.1, not a real model) actually received. All data is made up. The extension's own notices, such as the `/pii` status line, are in Chinese. Re-record it with [`docs/demo/record.sh`](docs/demo/record.sh) (see [Development and tests](#development-and-tests)).</sub>
+
 ## Is omp-pii-guard for you?
 
 An agent puts everything it reads into the prompt: a customer's name in a log, an address in a config file, a password in an `.env`. Once the request leaves your machine, the model vendor has it. omp-pii-guard sits between omp and the vendor:
@@ -317,6 +323,15 @@ bun test                # with Bun
 BUN_BE_BUN=1 omp test   # without Bun: the omp binary ships Bun (use your install path, e.g. Tern's omp/versions/18.18.1)
 bun run bench           # the benchmark behind the Performance section
 ```
+
+Re-record the demo GIFs in `docs/demo/` (needs [vhs](https://github.com/charmbracelet/vhs), tmux, gifsicle, an omp 18.18.x binary, and the model on disk; macOS: `brew install vhs tmux gifsicle`; the recordings use the Sarasa Mono SC font, `brew install --cask font-sarasa-gothic`):
+
+```sh
+npm ci --ignore-scripts
+OMP_BIN=/path/to/omp PII_GUARD_MODEL_DIR=~/.cache/magpie/astrlink-guard/7216b6a3b897 docs/demo/record.sh   # zh|en|all, default all
+```
+
+It runs a real omp (this extension, a temporary HOME and data directory, a fake API key; `~/.omp` is not touched) against `docs/demo/mock-server.ts`, a local mock of the Anthropic Messages API on 127.0.0.1 that prints the last user message it receives and replies from a fixed template quoting the placeholders. `demo.zh-CN.tape` and `demo.en.tape` hold the typing script.
 
 The tests include the magpie cases ported in T2, pipeline / entry / network-layer tests driven by a fake recognizer (a local http and WebSocket server checks the real bytes), and real-model tests (the model directory defaults to the magpie cache; they are skipped if it doesn't exist). The timing numbers are not asserted in tests, because timings are flaky.
 

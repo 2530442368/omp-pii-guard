@@ -16,6 +16,12 @@
 
 <br>
 
+<div align="center">
+<img src="docs/demo/demo.zh-CN.gif" width="900" alt="终端录屏：左栏是开启了 pii-guard 的 omp，右栏是本地模拟服务端。发出一段含人名、手机、邮箱、地址的请求；模拟服务端收到的只有 {{PERSON_…}} 等占位符；omp 里回复显示还原后的原值；最后 /pii 输出状态行。">
+</div>
+
+<sub>左栏：真实的 omp 18.18.1 会话 + 本扩展 + 真实模型。右栏：本地模拟服务端（127.0.0.1，不是真实模型）实际收到的内容。演示数据全部虚构。用 [`docs/demo/record.sh`](docs/demo/record.sh) 重录（见[开发与测试](#开发与测试)）。</sub>
+
 ## 适合你吗？
 
 智能体读到什么就把什么放进提示词：日志里客户的名字、配置文件里的地址、`.env` 里的密码。请求一旦离开本机，模型服务商就拿到了。omp-pii-guard 站在 omp 与服务商之间：
@@ -317,6 +323,15 @@ bun test                # 有 Bun 时
 BUN_BE_BUN=1 omp test   # 没有 Bun 时：omp 二进制自带 Bun（路径按你的安装位置，如 Tern 的 omp/versions/18.18.1）
 bun run bench           # 生成“性能”一节数字的基准
 ```
+
+重录 `docs/demo/` 里的演示动图（需要 [vhs](https://github.com/charmbracelet/vhs)、tmux、gifsicle、omp 18.18.x 二进制和本机已有的模型；macOS：`brew install vhs tmux gifsicle`；录制用 Sarasa Mono SC 字体，`brew install --cask font-sarasa-gothic`）：
+
+```sh
+npm ci --ignore-scripts
+OMP_BIN=/path/to/omp PII_GUARD_MODEL_DIR=~/.cache/magpie/astrlink-guard/7216b6a3b897 docs/demo/record.sh   # zh|en|all，默认 all
+```
+
+它用临时 HOME 与数据目录、假 API key 起一个真实的 omp（加载本扩展，不碰 `~/.omp`），连到 `docs/demo/mock-server.ts`：监听 127.0.0.1 的 Anthropic Messages 本地模拟，打印收到的最后一条用户消息，并按固定模板引用占位符回复。输入脚本在 `demo.zh-CN.tape` 与 `demo.en.tape`。
 
 含 T2 移植的 magpie 用例、假识别器驱动的管线/入口/网络层测试（本机 http 与 WebSocket 服务器验证真实字节）、真模型测试（模型目录默认 magpie 缓存，不存在则跳过）。测试里不对耗时做断言（耗时易抖）。
 
