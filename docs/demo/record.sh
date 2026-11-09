@@ -83,8 +83,10 @@ record() {
 
   "${TMUX[@]}" kill-server >/dev/null 2>&1 || true
   rm -rf "$HOME/.omp/agent/sessions"
+  local omp_cmd
+  printf -v omp_cmd 'exec %q -e %q --model anthropic/claude-sonnet-4-5 --no-title' "$OMP_BIN" "$REPO"
   "${TMUX[@]}" new-session -d -s "$SESSION" -x "$COLS" -y "$ROWS" -c "$HOME/shop" \
-    "exec '$OMP_BIN' -e '$REPO' --model anthropic/claude-sonnet-4-5 --no-title"
+    "$omp_cmd"
   local mock
   printf -v mock 'DEMO_LANG=%s DEMO_PORT=%s exec %q ' "$lang" "$PORT" "${BUN[0]}"
   for a in "${BUN[@]:1}" "$HERE/mock-server.ts"; do printf -v mock '%s%q ' "$mock" "$a"; done
