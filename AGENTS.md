@@ -41,7 +41,7 @@
 | `src/zhdata.ts`、`src/tlds.ts` | 机械生成的数据表（中文姓氏/词表、ICANN 顶级域），文件头注明来源；不要手工增删条目 |
 | `src/types.ts` | `Kind`、`RawFind`、`Span`、`ModelOptions` |
 | `test/*.test.ts` | `bun:test` 用例，每个 `src` 模块对应一个或多个文件（`index`、`transport`、`mask`、`payload`、`placeholder`、`setup`、`filters`、`known`、`zhname`、`email`、`offsets`、`local`、`perf`、`guard`）；`helpers.ts`（把 magpie 测试里的 fakeModel 换成 AstrLink 标签）、`fake.ts`（`FakeRecognizer`）是辅助 |
-| `scripts/install.sh` | 克隆后复制安装：校验并复制模型、复制 `src/` 到 omp 的扩展目录并 `npm ci`；不联网、不改 omp 配置 |
+| `scripts/install.sh` | 克隆后复制安装：校验并复制模型、复制 `src/` 到 omp 的扩展目录并 `npm ci`；模型只从本机缓存复制、不下载，`npm ci` 在依赖未缓存时会联网；不改 omp 配置 |
 | `scripts/bench.ts`、`scripts/bench-corpus.ts` | 基准与固定种子的合成语料生成器；README“性能”一节的数字来自它 |
 | `docs/demo/` | README 的演示动图（`demo.*.gif`）、vhs 脚本（`demo.*.tape`）、本地模拟服务端 `mock-server.ts`、重录脚本 `record.sh` |
 | `README.md`、`README.zh-CN.md` | 中英两份用户文档，内容必须同步 |
@@ -64,7 +64,7 @@
 
 说明：
 
-- 测试里的“真模型”用例（`test/guard.test.ts`、`test/index.test.ts` 的 `/pii setup` 里复制缓存的用例）在模型目录不存在时自动跳过；模型目录默认是 magpie 缓存 `~/.cache/magpie/astrlink-guard/7216b6a3b897`，`test/guard.test.ts` 可用 `PII_GUARD_TEST_MODEL_DIR` 覆盖。其余用例用假识别器，不需要模型。测试里不对耗时做断言。
+- 测试里的“真模型”用例（`test/guard.test.ts`、`test/index.test.ts` 的 `/pii setup` 里复制缓存的用例）在模型目录不存在时自动跳过；模型目录默认是 magpie 缓存 `~/.cache/magpie/astrlink-guard/7216b6a3b897`，`test/guard.test.ts` 可用 `PII_GUARD_TEST_MODEL_DIR` 覆盖。其余用例用假识别器，不需要模型。耗时断言只放在 `test/perf.test.ts` 的性能回归用例里（已知值补遮 200 ms、人为最坏情形与 `modelSpans` 1000 ms），其他测试不对耗时做断言。
 - 基准需要模型：依次找 `PII_GUARD_MODEL_DIR`、`<数据目录>/model`、magpie 缓存，找不到就先 `/pii setup`。其他开关：`THREADS`、`PII_BENCH_JSON`、`PII_BENCH_SEED`、`PII_BENCH_PER_KIND`、`PII_BENCH_REPS`、`PII_BENCH_DIRS`、`PII_BENCH_SESSIONS`（见 `scripts/bench.ts` 文件头）。
 - 重录动图前提：`vhs`、`tmux`、`gifsicle`、omp 18.18.x 二进制（`OMP_BIN`，默认取 PATH 里的 `omp`）、本机已有模型（`PII_GUARD_MODEL_DIR`）、先 `npm ci --ignore-scripts`；`.tape` 里用 Sarasa Mono SC 字体。脚本用临时 HOME 和数据目录，不碰真实的 `~/.omp`。动图是二进制文件，没有这些前提就不要重录，也不要手改 `.tape` 后不重录。
 
