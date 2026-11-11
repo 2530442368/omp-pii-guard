@@ -89,7 +89,7 @@
 12. **偏移一律是 JS 字符串下标（UTF-16 码元）。** 从 magpie（Go 字节下标）移植的判断，按字节算长度的地方（如密钥最短 8、`MIN_KNOWN`、数字占比）仍用 `byteLen`（UTF-8 字节数），其余按码元。与 magpie 行为有差别的地方，在代码注释里写明“与 magpie 的差别”和原因（写法参照 `src/known.ts` 文件头）；用例要覆盖 emoji、代理对（`test/offsets.test.ts`）。
 13. **子代理与主会话同进程**：模型、缓存、占位符表、网络层包装用 `globalThis` 单例（`Symbol.for("omp-pii-guard.runtime")`、`Symbol.for("omp-pii-guard.transport")`），只装一次；新增全局状态要遵守同一做法，并保证测试里能重置（现有的进程单例由 `testHooks.reset()` 清掉）。
 
-14. **Tern 状态文件是对外契约（版本 1），只含计数与状态。** 文件内容（`TernBody`/`TernFile`，`src/tern.ts`）不得出现任何原值、占位符、会话内容、请求内容；`summary` 来自 `/pii` 的摘要（只有计数、开关和模型加载失败的原因），新增字段前先确认它不会带出这些东西。只有 `TERN_PANE` 是正整数时才写，且只有主会话的交互界面（`ctx.hasUI`、非子代理、`mode` 未给出或为 `tui`）才认领；写入失败一律吞掉（只记 debug），不能影响遮挡、不能让请求失败或放行；权限 0600/目录 0700、临时文件 + rename；退出和会话关闭时删文件。改字段含义或格式要提高 `TERN_STATE_VERSION`，同步 `tern-plugin/window.luau`（它只认 `v == 1`）、两份 README 和 `test/tern.test.ts`。插件侧只读这个文件，不得反过来向扩展写东西。
+14. **Tern 状态文件是对外契约（版本 1），只含计数与状态。** 文件内容（`TernBody`/`TernFile`，`src/tern.ts`）不得出现任何原值、占位符、会话内容、请求内容；`summary` 来自 `/pii` 的摘要（只有计数、开关和模型加载失败的原因），新增字段前先确认它不会带出这些东西。只有 `TERN_PANE` 是正整数时才写，且只有主会话的交互界面（`ctx.hasUI`、非子代理、`mode` 未给出或为 `tui`）才认领；写入失败一律吞掉（只记 debug），不能影响遮挡、不能让请求失败或放行；写前 lstat 校验状态目录（真实目录、非符号链接、属主是当前用户，权限收紧到 0700，做不到就放弃）；临时文件用随机名 + `wx` 排他创建、0600，再 rename；退出和会话关闭时只删“本实例写过且文件里 pid 是自己”的文件（没认领的进程如 `omp -p` 不得删别人的）。插件把文件当不可信输入，`validate()` 逐项校验后才进缓存，`kill -0` 只对校验过的 pid 调用；新增字段要同步校验。会话切换（`session_switch`/`branch`/`tree` 不会重跑工厂）时，本会话计数 `used` 由 `loadBranch` 按目标分支里的映射条目重建，`/pii` 与状态文件共用它。改字段含义或格式要提高 `TERN_STATE_VERSION`，同步 `tern-plugin/window.luau`（它只认 `v == 1`）、两份 README 和 `test/tern.test.ts`。插件侧只读这个文件，不得反过来向扩展写东西。
 
 ## 6. 改动流程与验证
 

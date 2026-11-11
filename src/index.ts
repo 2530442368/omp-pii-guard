@@ -337,6 +337,16 @@ export default function piiGuard(pi: any): void {
         }
       }
     }
+    // 本会话已遮挡的计数（/pii 与 Tern 状态文件）按目标分支重建：session_switch/branch/tree 不会重跑工厂，
+    // 沿用旧会话的 used 会让新会话报旧会话的数。映射条目 = 这个分支里出现在请求中的占位符（noteUsed 写入的）；
+    // 被类别/允许词过滤掉的（映射里已无）不计，与 noteUsed 的口径一致。
+    used.clear();
+    for (const ph of persisted.keys()) {
+      const kind = /^\{\{([A-Z]+)_/.exec(ph)?.[1] as Kind | undefined;
+      if (!kind || rt.ph.lookup(ph) === undefined) continue;
+      used.set(kind, (used.get(kind) ?? new Set<string>()).add(ph));
+    }
+    rt.tern?.touch();
     return entries;
   };
 

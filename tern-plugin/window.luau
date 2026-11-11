@@ -54,18 +54,72 @@ local function total(s: State): number
 	return n
 end
 
--- 读并校验 <pane>.json；读不到、不是版本 1、不是这个窗格的返回 nil。
+local MAX_PID = 4194304 -- 2^22：Linux pid_max 的上限，macOS 更小
+local MAX_COUNT = 1000000000
+local MAX_SUMMARY = 500 -- 字符
+local MODEL_STATES = { ready = true, loading = true, setup = true, unavailable = true, idle = true }
+
+local function isInt(v: any, lo: number, hi: number): boolean
+	return type(v) == "number" and v == v and v >= lo and v <= hi and v == math.floor(v)
+end
+
+-- 状态文件是别的进程写的、不可信：逐项校验，只把校验过的字段拷进一张新表；任何一项不符都当作没有状态。
+local function validate(data: any, pane: number): State?
+	if type(data) ~= "table" then return nil end
+	if data.v ~= 1 then return nil end
+	if not isInt(data.pid, 1, MAX_PID) or data.pane ~= pane then return nil end
+	if type(data.on) ~= "boolean" then return nil end
+	local off = data.off
+	if off ~= nil and off ~= "env" and off ~= "user" then return nil end
+	local model = data.model
+	if type(model) ~= "table" or type(model.state) ~= "string" or not MODEL_STATES[model.state] then return nil end
+	local reason = model.reason
+	if reason ~= nil and reason ~= "files" and reason ~= "other" then return nil end
+	if type(data.kinds) ~= "table" then return nil end
+	local kinds: { [string]: number } = {}
+	for _, k in ipairs(KINDS) do
+		local c = data.kinds[k]
+		if not isInt(c, 0, MAX_COUNT) then return nil end
+		kinds[k] = c
+	end
+	if not isInt(data.requests, 0, MAX_COUNT) or not isInt(data.failed, 0, MAX_COUNT) then return nil end
+	if data.level ~= "info" and data.level ~= "warning" then return nil end
+	local summary = data.summary
+	if type(summary) ~= "string" then return nil end
+	local chars = utf8.len(summary)
+	if chars == nil then return nil end
+	if chars > MAX_SUMMARY then
+		summary = string.sub(summary, 1, utf8.offset(summary, MAX_SUMMARY + 1) - 1) .. "…"
+	end
+	if type(data.updatedAt) ~= "number" or data.updatedAt ~= data.updatedAt or data.updatedAt < 0 then return nil end
+	return {
+		v = 1,
+		pid = data.pid,
+		pane = data.pane,
+		on = data.on,
+		off = off,
+		model = { state = model.state, reason = reason },
+		kinds = kinds,
+		requests = data.requests,
+		failed = data.failed,
+		level = data.level,
+		summary = summary,
+		updatedAt = data.updatedAt,
+	}
+end
+
+-- 读并校验 <pane>.json；读不到、解析不了、校验不过（含不是这个窗格的）都返回 nil。
 local function read(pane: number): State?
+	if not isInt(pane, 1, 9007199254740991) then return nil end
 	local path = string.format("%s/%d.json", stateDir(), pane)
 	if not tern.fs.exists(path) then return nil end
 	local ok, text = pcall(tern.fs.read, path, 65536)
 	if not ok then return nil end
 	local okj, data = pcall(tern.json.decode, text)
-	if not okj or type(data) ~= "table" then return nil end
-	if data.v ~= 1 or data.pane ~= pane or type(data.pid) ~= "number" or type(data.kinds) ~= "table" or type(data.summary) ~= "string" then
-		return nil
-	end
-	return data :: State
+	if not okj then return nil end
+	local okv, state = pcall(validate, data, pane)
+	if not okv then return nil end
+	return state
 end
 
 -- 段的内容（formatter 与变化检测共用；纯函数）。
@@ -80,11 +134,13 @@ local function segment(s: State): { text: string, icon: string, tone: string?, c
 	return { text = "PII " .. n, icon = "shield", tone = if n > 0 then "accent" else nil, command = "plugin.pii-guard.details" }
 end
 
-local function signature(pane: number?): string
-	local s = if pane then cache[pane] else nil
-	if not s then return "" end
+-- 底栏要不要重画的依据：窗格身份 + 有没有状态 + 段的内容。formatter 的结果按输入（窗格）缓存，
+-- 切到另一个窗格、或从“没有状态”变成“有”，哪怕段文字一样也必须 refresh，否则缓存里的旧结果（nil）会一直留着。
+local function signature(pane: number): string
+	local s = cache[pane]
+	if not s then return string.format("%d:-", pane) end
 	local seg = segment(s)
-	return seg.text .. "|" .. seg.icon .. "|" .. (seg.tone or "")
+	return string.format("%d:%s|%s|%s", pane, seg.text, seg.icon, seg.tone or "")
 end
 
 -- 进程是否存活：kill -0（退出码 0 = 存在；EPERM 也说明存在）。只在状态文件存在时才起进程，
@@ -104,7 +160,7 @@ local function probe(cx: WindowCx, s: State, cb: (boolean, WindowCx?) -> ())
 		cb(false, cx)
 		return
 	end
-	tern.process.run({ "/bin/kill", "-0", tostring(s.pid) }, { timeout_ms = 2000 }, function(result, cx2)
+	tern.process.run({ "/bin/kill", "-0", string.format("%d", s.pid) }, { timeout_ms = 2000 }, function(result, cx2)
 		local ok = result.status == 0 or string.find(result.stderr, "not permitted", 1, true) ~= nil
 		if ok then
 			alive[s.pane] = { pid = s.pid, at = tern.now() }

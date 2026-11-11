@@ -16,6 +16,7 @@ type Handler = (event: any, ctx: any) => any;
 function makePi() {
   const handlers = new Map<string, Handler[]>();
   const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+  const entries: { type: string; data: any }[] = [];
   const pi = {
     setLabel() {},
     on(ev: string, h: Handler) {
@@ -25,7 +26,9 @@ function makePi() {
       commands.set(name, o);
     },
     registerAssistantTextRenderer() {},
-    appendEntry() {},
+    appendEntry(type: string, data: any) {
+      entries.push({ type, data });
+    },
     logger: { debug() {} },
   };
   const emit = async (ev: string, event: any, ctx: any) => {
@@ -33,7 +36,7 @@ function makePi() {
     for (const h of handlers.get(ev) ?? []) last = await h(event, ctx);
     return last;
   };
-  return { pi, commands, emit };
+  return { pi, commands, entries, emit };
 }
 
 function makeCtx(over: Record<string, any> = {}) {
@@ -42,7 +45,7 @@ function makeCtx(over: Record<string, any> = {}) {
     model: { api: "anthropic-messages", baseUrl: "https://api.anthropic.com" },
     hasUI: true,
     ui: { notify: (msg: string, level: string) => notes.push({ msg, level }) },
-    sessionManager: { getBranch: () => [] },
+    sessionManager: { getBranch: (): any[] => [] },
     setTimeout: (fn: () => unknown, ms: number) => setTimeout(() => void Promise.resolve(fn()).catch(() => {}), ms),
     ...over,
   };
@@ -60,6 +63,14 @@ function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
   setTimeout(resolve, ms);
   return promise;
+}
+
+// 等待进行中的合并写走完（写是同步的，定时器触发即写完）：比固定睡眠在负载高时稳。只用于“应该写出来”的断言；
+// “不应该写”的断言仍用固定睡眠，给假想中的写入足够的时间。
+async function settle(): Promise<void> {
+  const rt = testHooks.runtime();
+  for (let i = 0; i < 400 && rt.tern?.pending; i++) await sleep(5);
+  await sleep(5);
 }
 
 let dir: string;
@@ -140,7 +151,7 @@ describe("只在 Tern 里写", () => {
     piiGuard(t.pi);
     const { ctx } = makeCtx({ mode: "tui", agent: { kind: "main" } });
     await t.emit("session_start", {}, ctx);
-    await sleep(60);
+    await settle();
     expect(fs.existsSync(path.join(ternDir, "7.json"))).toBe(true);
   });
 });
@@ -155,7 +166,7 @@ describe("内容", () => {
     const p = payload();
     await t.emit("before_provider_request", { payload: p }, ctx);
     expect(JSON.stringify(p)).toMatch(/\{\{PHONE_/); // 确实遮了
-    await sleep(80);
+    await settle();
     const raw = fs.readFileSync(path.join(ternDir, "7.json"), "utf8");
     const s: TernFile = JSON.parse(raw);
     expect(s.v).toBe(1);
@@ -183,31 +194,31 @@ describe("内容", () => {
     piiGuard(t.pi);
     const { ctx } = makeCtx();
     await t.emit("session_start", {}, ctx);
-    await sleep(60);
+    await settle();
     expect(readState().model).toEqual({ state: "ready" });
     rt.guard = undefined;
     rt.guardP = undefined;
     rt.tern!.touch();
-    await sleep(60);
+    await settle();
     expect(readState().model).toEqual({ state: "idle" });
     // 模型不可用：文件缺失类 / 其他
     rt.guardErr = "模型加载失败：模型文件不可用：缺少 model_int8.onnx";
     rt.tern!.touch();
-    await sleep(60);
+    await settle();
     expect(readState().model).toEqual({ state: "unavailable", reason: "files" });
     expect(readState().level).toBe("warning");
     rt.guardErr = "模型加载失败：boom";
     rt.tern!.touch();
-    await sleep(60);
+    await settle();
     expect(readState().model).toEqual({ state: "unavailable", reason: "other" });
     rt.guardErr = undefined;
     // /pii off、/pii on
     await t.commands.get("pii")!.handler("off", ctx);
-    await sleep(60);
+    await settle();
     expect(readState()).toMatchObject({ on: false, off: "user", level: "info" });
     expect(readState().summary).toContain("已关闭");
     await t.commands.get("pii")!.handler("on", ctx);
-    await sleep(60);
+    await settle();
     expect(readState()).toMatchObject({ on: true });
     expect(readState().off).toBeUndefined();
   });
@@ -220,7 +231,7 @@ describe("内容", () => {
     const { ctx } = makeCtx();
     await t.emit("session_start", {}, ctx);
     expect(await t.emit("before_provider_request", { payload: payload() }, ctx)).toEqual({});
-    await sleep(80);
+    await settle();
     const s = readState();
     expect(s.failed).toBe(1);
     expect(s.level).toBe("warning");
@@ -235,7 +246,7 @@ describe("内容", () => {
     piiGuard(t.pi);
     const { ctx } = makeCtx();
     await t.emit("session_start", {}, ctx);
-    await sleep(80);
+    await settle();
     expect(readState()).toMatchObject({ on: false, off: "env" });
   });
 });
@@ -248,7 +259,7 @@ describe("写入方式", () => {
     const { ctx } = makeCtx();
     await t.emit("session_start", {}, ctx);
     await t.emit("before_provider_request", { payload: payload() }, ctx);
-    await sleep(80);
+    await settle();
     expect(fs.statSync(path.join(ternDir, "7.json")).mode & 0o777).toBe(0o600);
     expect(fs.statSync(ternDir).mode & 0o777).toBe(0o700);
     expect(fs.readdirSync(ternDir)).toEqual(["7.json"]);
@@ -302,7 +313,7 @@ describe("写入方式", () => {
     piiGuard(t.pi);
     const { ctx } = makeCtx();
     await t.emit("session_start", {}, ctx);
-    await sleep(80);
+    await settle();
     expect(fs.readdirSync(ternDir).sort()).toEqual(["4.json", "5.json", "7.json", "notes.txt"]);
   });
 });
@@ -314,12 +325,12 @@ describe("删除", () => {
     piiGuard(t.pi);
     const { ctx } = makeCtx();
     await t.emit("session_start", {}, ctx);
-    await sleep(60);
+    await settle();
     expect(fs.existsSync(path.join(ternDir, "7.json"))).toBe(true);
     await t.emit("session_shutdown", {}, ctx);
     expect(fs.existsSync(path.join(ternDir, "7.json"))).toBe(false);
     await t.emit("before_provider_request", { payload: payload() }, ctx); // 关闭后不再写
-    await sleep(60);
+    await settle();
     expect(fs.existsSync(path.join(ternDir, "7.json"))).toBe(false);
   });
 
@@ -332,13 +343,13 @@ describe("删除", () => {
     piiGuard(t.pi);
     const { ctx } = makeCtx();
     await t.emit("session_start", {}, ctx);
-    await sleep(60);
+    await settle();
     const file = path.join(ternDir, "7.json");
     expect(fs.existsSync(file)).toBe(true);
     added[0]!(0); // 相当于进程退出
     expect(fs.existsSync(file)).toBe(false);
     rt.tern!.touch();
-    await sleep(60);
+    await settle();
     expect(fs.existsSync(file)).toBe(true);
     testHooks.reset();
     expect(fs.existsSync(file)).toBe(false);
@@ -354,7 +365,7 @@ describe("会话切换", () => {
     const { ctx: ctx1 } = makeCtx();
     await t1.emit("session_start", {}, ctx1);
     await t1.emit("before_provider_request", { payload: payload() }, ctx1);
-    await sleep(80);
+    await settle();
     expect(readState().kinds.PHONE).toBe(1);
 
     // 新会话（工厂重跑）：自己的 used 是空的
@@ -362,7 +373,7 @@ describe("会话切换", () => {
     piiGuard(t2.pi);
     const { ctx: ctx2 } = makeCtx();
     await t2.emit("session_start", {}, ctx2);
-    await sleep(80);
+    await settle();
     expect(readState().kinds).toEqual({ PERSON: 0, ADDRESS: 0, PHONE: 0, EMAIL: 0, ACCOUNT: 0, SECRET: 0 });
 
     await t1.emit("session_shutdown", {}, ctx1); // 旧会话收尾
@@ -382,7 +393,151 @@ describe("会话切换", () => {
     piiGuard(t2.pi);
     const { ctx: sub } = makeCtx({ agent: { kind: "sub" } });
     await t2.emit("session_start", {}, sub);
-    await sleep(80);
+    await settle();
     expect(readState().kinds.PHONE).toBe(1);
+  });
+});
+
+describe("真实的会话切换（工厂不重跑）", () => {
+  test("同一工厂实例上 session_switch：计数按目标会话分支重建，状态文件与 /pii 随之变化", async () => {
+    fresh();
+    const t = makePi();
+    piiGuard(t.pi);
+    let branch: any[] = [];
+    const { ctx, notes } = makeCtx();
+    ctx.sessionManager.getBranch = () => branch;
+    await t.emit("session_start", {}, ctx);
+    await t.emit("before_provider_request", { payload: payload() }, ctx);
+    await settle();
+    const before = readState().kinds;
+    expect(before).toEqual({ PERSON: 1, ADDRESS: 0, PHONE: 1, EMAIL: 1, ACCOUNT: 0, SECRET: 0 });
+    expect(t.entries.length).toBe(1);
+    const mapEntry = { type: "custom", customType: "pii-guard.map", data: t.entries[0]!.data };
+    await t.commands.get("pii")!.handler("", ctx);
+    const summaryBefore = notes.at(-1)!.msg;
+    expect(summaryBefore).toContain("人名 1");
+
+    // /new：目标会话没有映射条目 → 计数归零
+    branch = [];
+    await t.emit("session_switch", {}, ctx);
+    await settle();
+    expect(readState().kinds).toEqual({ PERSON: 0, ADDRESS: 0, PHONE: 0, EMAIL: 0, ACCOUNT: 0, SECRET: 0 });
+    await t.commands.get("pii")!.handler("", ctx);
+    expect(notes.at(-1)!.msg).toContain("本会话还没有需要遮挡的内容");
+    expect(readState().summary).toBe(notes.at(-1)!.msg);
+
+    // 切回有映射的会话 → 计数恢复
+    branch = [mapEntry];
+    await t.emit("session_switch", {}, ctx);
+    await settle();
+    expect(readState().kinds).toEqual(before);
+    await t.commands.get("pii")!.handler("", ctx);
+    expect(notes.at(-1)!.msg).toBe(summaryBefore.replace(/已检查 \d+ 个请求/, `已检查 ${readState().requests} 个请求`));
+    expect(readState().summary).toBe(notes.at(-1)!.msg);
+
+    // 分支切换（session_branch / session_tree）同理
+    branch = [];
+    await t.emit("session_branch", {}, ctx);
+    await settle();
+    expect(readState().kinds.PERSON).toBe(0);
+    branch = [mapEntry];
+    await t.emit("session_tree", {}, ctx);
+    await settle();
+    expect(readState().kinds).toEqual(before);
+  });
+});
+
+describe("只删自己写的文件", () => {
+  const other = () => spawnSync("true").pid!; // 另一个进程的 pid（已退出也无妨：只比较数值）
+  const seed = (pid: number) => {
+    fs.mkdirSync(ternDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(ternDir, "7.json"), JSON.stringify({ v: 1, pid, pane: 7 }));
+  };
+
+  test("没认领/没写过的实例（如 omp -p）退出时不删别人的文件", async () => {
+    const before = new Set(process.listeners("exit"));
+    fresh();
+    const added = process.listeners("exit").filter((l) => !before.has(l));
+    seed(process.pid + 1);
+    const t = makePi();
+    piiGuard(t.pi);
+    const { ctx } = makeCtx({ hasUI: false }); // 无界面：不认领
+    await t.emit("session_start", {}, ctx);
+    await sleep(60);
+    added[0]!(0); // 进程退出
+    await t.emit("session_shutdown", {}, ctx);
+    testHooks.reset(); // dispose
+    expect(JSON.parse(fs.readFileSync(path.join(ternDir, "7.json"), "utf8")).pid).toBe(process.pid + 1);
+  });
+
+  test("写过之后文件被别的进程接管（pid 不同）：退出时不删", async () => {
+    fresh();
+    const t = makePi();
+    piiGuard(t.pi);
+    const { ctx } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    await settle();
+    expect(readState().pid).toBe(process.pid);
+    seed(other()); // 另一个 omp 覆盖了同名文件
+    await t.emit("session_shutdown", {}, ctx);
+    expect(fs.existsSync(path.join(ternDir, "7.json"))).toBe(true);
+    testHooks.reset();
+    expect(fs.existsSync(path.join(ternDir, "7.json"))).toBe(true);
+  });
+});
+
+describe("状态目录与临时文件的安全", () => {
+  test("状态目录是符号链接：不写，也不往链接目标里写", async () => {
+    fresh();
+    const target = fs.mkdtempSync(path.join(os.tmpdir(), "pii-tern-target-"));
+    try {
+      fs.symlinkSync(target, ternDir);
+      const t = makePi();
+      piiGuard(t.pi);
+      const { ctx } = makeCtx();
+      await t.emit("session_start", {}, ctx);
+      await t.emit("before_provider_request", { payload: payload() }, ctx);
+      await sleep(80);
+      expect(fs.readdirSync(target)).toEqual([]);
+    } finally {
+      fs.rmSync(target, { recursive: true, force: true });
+    }
+  });
+
+  test("状态目录权限过宽：收紧到 0700 再写", async () => {
+    fresh();
+    fs.mkdirSync(ternDir, { mode: 0o755 });
+    fs.chmodSync(ternDir, 0o755);
+    const t = makePi();
+    piiGuard(t.pi);
+    const { ctx } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    await settle();
+    expect(fs.statSync(ternDir).mode & 0o777).toBe(0o700);
+    expect(readState().pane).toBe(7);
+  });
+
+  test("预置的同名/旧式临时文件与符号链接不受影响；目标文件是符号链接时被替换而不是写穿", async () => {
+    fresh();
+    fs.mkdirSync(ternDir, { recursive: true, mode: 0o700 });
+    const victim = path.join(dir, "victim.txt");
+    fs.writeFileSync(victim, "别动我");
+    const oldTmp = path.join(ternDir, `7.json.${process.pid}.tmp`);
+    fs.writeFileSync(oldTmp, "旧临时文件");
+    const linkTmp = path.join(ternDir, "7.json.tmp");
+    fs.symlinkSync(victim, linkTmp);
+    fs.symlinkSync(victim, path.join(ternDir, "7.json")); // 最终文件名上也是指向受害文件的符号链接
+    const t = makePi();
+    piiGuard(t.pi);
+    const { ctx } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    await settle();
+    expect(fs.readFileSync(victim, "utf8")).toBe("别动我");
+    expect(fs.readFileSync(oldTmp, "utf8")).toBe("旧临时文件");
+    expect(fs.lstatSync(linkTmp).isSymbolicLink()).toBe(true);
+    expect(fs.lstatSync(path.join(ternDir, "7.json")).isFile()).toBe(true);
+    expect(readState().pane).toBe(7);
+    // 写过的临时文件都已 rename 走，除预置的两个外没有遗留
+    expect(fs.readdirSync(ternDir).sort()).toEqual(["7.json", "7.json.tmp", `7.json.${process.pid}.tmp`].sort());
   });
 });
