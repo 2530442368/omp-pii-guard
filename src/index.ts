@@ -9,13 +9,13 @@
 //     （只显示，不进对话、不进模型上下文、不进通知与日志、不写文件；只在 ctx.mode === "tui" 时显示，RPC/打印/协作转发的界面一律不显示）。
 //     Tern 插件的底栏点击只是向本窗格发这个快捷键（状态文件的 list 字段为 true 时才发），不读写原值。
 
-import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ALL_KINDS, envDisabled, envNoRestore, loadConfig, paths, type Config, type Paths } from "./config.ts";
 import { AstrGuard, Limiter } from "./guard.ts";
 import { LocalLiterals } from "./local.ts";
 import { LIST_MAX_VALUE, openValueList, type ListItem } from "./list-ui.ts";
+import { clearMarker, markerState, writeMarker } from "./listkey.ts";
 import { MaskTimeout, Masker } from "./mask.ts";
 import { detectFormat, formatForApi, maskPayload, type TextItem, type TextMasker } from "./payload.ts";
 import { PH_RE, Placeholders, loadKey, restorePolicy } from "./placeholder.ts";
@@ -474,12 +474,13 @@ export default function piiGuard(pi: any): void {
       listOpen = false;
     }
   };
-  // 快捷键：别的绑定占着它就不注册（omp 在加载阶段不允许查询，所以靠上次 session_start 留下的标记），免得抢占别人的绑定
-  // （同一个键后注册的覆盖先注册的）；Tern 底栏点击发的就是这个键，所以 Tern 状态文件的 list 也跟着它走。
+  // 快捷键：别的绑定占着它时，下次启动起不再注册（omp 在加载阶段不允许查询，所以只能靠 session_start 里发现冲突后留下的标记）。
+  // 已知限制：首次遇到冲突的那一次启动，本扩展已经先注册了；同一个键后注册的覆盖先注册的，所以那一次启动内可能覆盖了对方的绑定。
+  // Tern 底栏点击发的就是这个键，所以 Tern 状态文件的 list 也跟着它走（冲突时为 false，插件不发键）。
   const listKeyMarker = path.join(rt.paths.root, "list-key-taken");
   let keyRegistered = false;
   try {
-    if (!fs.existsSync(listKeyMarker)) {
+    if (markerState(listKeyMarker) !== "file") {
       pi.registerShortcut(LIST_KEY, { description: "PII Guard：查看本会话遮挡的值", handler: showList });
       keyRegistered = true;
     }
@@ -499,12 +500,11 @@ export default function piiGuard(pi: any): void {
     if (!known) return;
     try {
       if (keyRegistered && held) {
-        fs.mkdirSync(rt.paths.root, { recursive: true, mode: 0o700 });
-        fs.writeFileSync(listKeyMarker, "别的绑定占着列表快捷键时由 pii-guard 写入：存在时启动不注册它；快捷键空闲后启动时自动删除。\n", { mode: 0o600 });
-        notify(rt, `快捷键 ${LIST_KEY} 已被占用（${held.kind ?? "未知"}），本扩展的列表快捷键与 Tern 底栏点击暂不可用，请用 /pii list；下次启动起本扩展不再注册这个键，不抢占别人的绑定`, "warning");
-      } else if (!keyRegistered && !held) {
-        fs.rmSync(listKeyMarker, { force: true });
-        notify(rt, `快捷键 ${LIST_KEY} 已空闲，重启 omp 后恢复列表快捷键与 Tern 底栏点击；现在可用 /pii list`, "info");
+        writeMarker(listKeyMarker);
+        notify(rt, `快捷键 ${LIST_KEY} 已被占用（${held.kind ?? "未知"}），本扩展的列表快捷键与 Tern 底栏点击暂不可用，请用 /pii list；这一次启动里本扩展可能已经覆盖了对方的绑定（omp 不允许在注册前查询），下次启动起不再注册这个键、对方的绑定恢复`, "warning");
+      } else if (!held && markerState(listKeyMarker) !== "absent") {
+        clearMarker(listKeyMarker); // 异常物（符号链接等）只删目录项本身，不提示
+        if (!keyRegistered) notify(rt, `快捷键 ${LIST_KEY} 已空闲，重启 omp 后恢复列表快捷键与 Tern 底栏点击；现在可用 /pii list`, "info");
       }
     } catch (e) {
       pi.logger?.debug?.(`[pii-guard] 列表快捷键标记读写失败：${String((e as Error)?.message ?? e)}`);

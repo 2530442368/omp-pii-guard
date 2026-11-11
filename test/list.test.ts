@@ -1260,6 +1260,50 @@ describe("列表组件", () => {
     expect(wrap("", 10)).toEqual([""]);
   });
 
+  test("详情：10、6、5、3、1 列的窄宽度也按实际宽度折行，逐屏滚动拼回去恰好是完整原值（不丢字）", () => {
+    // 收集详情里全部原值行：一屏放不下就逐屏滚动，按页脚的“第 a–b 行”只取新出现的行
+    const collect = (c: ListComponent, width: number): string[] => {
+      let f = c.render(width);
+      const indent = width >= 6 ? 2 : 0;
+      const rows = (fr: readonly string[]) => fr.slice(2).filter((r) => !/^第 \d+–\d+ 行 \/ 共 \d+ 行$/.test(r)).map((r) => r.slice(indent));
+      const out = rows(f);
+      let seen = out.length;
+      for (let guard = 0; guard < 500; guard++) {
+        const m = /^第 (\d+)–(\d+) 行 \/ 共 (\d+) 行$/.exec(f.at(-1)!);
+        if (!m || Number(m[2]) >= Number(m[3])) break;
+        c.handleInput(KEYS["tui.select.pageDown"]!);
+        f = c.render(width);
+        const end = Number(/^第 \d+–(\d+)/.exec(f.at(-1)!)![1]);
+        const got = rows(f);
+        out.push(...got.slice(got.length - (end - seen)));
+        seen = end;
+      }
+      return out;
+    };
+    const cases: [number, string][] = [
+      [10, "地址北京市朝阳区建国路88号 Building 3, Room 1203, Kexing Science Park 😀 深圳市南山区科技园科苑路15号中文😀 abc"],
+      [6, "北京市朝阳区建国路 88 号 3 单元 1203"],
+      [5, "Room 1203, Building B3"],
+      [3, "ab中文😀cd{{X}}"],
+      [1, "ascii only, 1col"],
+    ];
+    for (const [width, value] of cases) {
+      const { env: e } = env({ rows: () => 1000 });
+      const c = new ValueList([item({ kind: "地址", value })], e);
+      c.handleInput(ENTER);
+      const lines = collect(c, width);
+      expect(lines.join("")).toBe(value);
+      const limit = width >= 6 ? width - 2 : width;
+      // 能放进去的字符不超宽；1 列里的宽字符没法更窄，单独占一行
+      for (const l of lines) expect(columns(l) <= Math.max(limit, 2)).toBe(true);
+      // 整帧每行（含前缀、标题、提示、页脚）也不超过实际宽度（宽字符在 1 列里除外）
+      if (width >= 3) for (const r of c.render(width)) expect(columns(r)).toBeLessThanOrEqual(width);
+      // 列表层同样不超宽，也不 throw
+      c.handleInput(ESC);
+      for (const r of c.render(width)) expect(columns(r)).toBeLessThanOrEqual(Math.max(width, 1));
+    }
+  });
+
   test("主题着色出错（theme.fg 抛错）时回落成纯文本，不影响显示", () => {
     const { env: e } = env({ theme: { fg: () => { throw new Error("坏主题"); }, bold: () => { throw new Error("坏主题"); } } });
     const c = new ValueList([item()], e);
@@ -1509,6 +1553,70 @@ describe("列表快捷键：不抢占别人的绑定；Tern 状态文件的 list
       expect(fs.existsSync(marker())).toBe(false);
       expect(testHooks.runtime().listKey).toBe(false);
     }
+  });
+
+  describe("标记文件不跟随符号链接", () => {
+    const outside = () => path.join(dir, "outside-target");
+
+    test("标记是指向不存在目标的悬空符号链接：当作没有标记（照常注册）；发现占用时换成普通文件，目标不会被创建", async () => {
+      fresh();
+      fs.symlinkSync(outside(), marker());
+      const t = makePi();
+      t.conflicts.set(LIST_KEY, { kind: "extension", extensionPath: "/other" });
+      piiGuard(t.pi);
+      expect(t.shortcuts.has(LIST_KEY)).toBe(true);
+      await t.emit("session_start", {}, makeCtx().ctx);
+      expect(fs.existsSync(outside())).toBe(false);
+      const st = fs.lstatSync(marker());
+      expect(st.isFile()).toBe(true);
+      expect(st.isSymbolicLink()).toBe(false);
+      expect(st.mode & 0o777).toBe(0o600);
+      expect(fs.readdirSync(dir).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    });
+
+    test("标记是符号链接（指向真实文件）、没人占用：只删链接本身，目标文件内容不变，不提示", async () => {
+      fresh();
+      const target = outside();
+      fs.writeFileSync(target, "keep");
+      fs.symlinkSync(target, marker());
+      const t = makePi();
+      piiGuard(t.pi);
+      expect(t.shortcuts.has(LIST_KEY)).toBe(true);
+      const { ctx, notes } = makeCtx();
+      await t.emit("session_start", {}, ctx);
+      expect(fs.existsSync(target) && fs.readFileSync(target, "utf8")).toBe("keep");
+      expect(() => fs.lstatSync(marker())).toThrow();
+      expect(keyNotes(notes)).toEqual([]);
+    });
+
+    test("数据目录本身是符号链接：不写（不在链接指向的目录里造标记），只记 debug，不抛错", async () => {
+      fresh();
+      const real = path.join(dir, "real-root");
+      fs.mkdirSync(real);
+      const link = path.join(dir, "link-root");
+      fs.symlinkSync(real, link);
+      const rt = testHooks.runtime();
+      rt.paths = { ...rt.paths, root: link };
+      const t = makePi();
+      t.conflicts.set(LIST_KEY, { kind: "reserved" });
+      piiGuard(t.pi);
+      await t.emit("session_start", {}, makeCtx().ctx);
+      expect(fs.readdirSync(real)).toEqual([]);
+      expect(t.debug.some((d) => d.includes("标记"))).toBe(true);
+    });
+
+    test("标记位置是个目录：不当标记（照常注册）、不删目录；发现占用时写不进去只记 debug", async () => {
+      fresh();
+      fs.mkdirSync(marker());
+      fs.writeFileSync(path.join(marker(), "inner"), "x");
+      const t = makePi();
+      t.conflicts.set(LIST_KEY, { kind: "reserved" });
+      piiGuard(t.pi);
+      expect(t.shortcuts.has(LIST_KEY)).toBe(true);
+      await t.emit("session_start", {}, makeCtx().ctx);
+      expect(fs.readFileSync(path.join(marker(), "inner"), "utf8")).toBe("x");
+      expect(t.debug.some((d) => d.includes("标记"))).toBe(true);
+    });
   });
 
   test("标记文件写不进去（数据目录是个文件）：只记 debug，不抛错、不影响启动", async () => {

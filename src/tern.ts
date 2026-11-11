@@ -139,35 +139,13 @@ export class TernWriter {
       const body = src();
       const key = JSON.stringify(body);
       if (key === this.last) return;
-      this.ensureDir();
+      ensureOwnDir(this.dir);
       if (!this.swept) {
         this.swept = true;
         this.sweepStale();
       }
       const file: TernFile = { v: TERN_STATE_VERSION, pid: this.pid, pane: this.pane, ...body, updatedAt: Date.now() };
-      const tmp = `${this.file}.${this.pid}.${randomBytes(6).toString("hex")}.tmp`;
-      let fd: number | undefined;
-      let created = false;
-      try {
-        fd = fs.openSync(tmp, "wx", 0o600); // 排他创建：已存在的文件或符号链接一律拒绝
-        created = true;
-        fs.writeSync(fd, JSON.stringify(file));
-        fs.closeSync(fd);
-        fd = undefined;
-        fs.renameSync(tmp, this.file);
-      } catch (e) {
-        if (fd !== undefined) {
-          try {
-            fs.closeSync(fd);
-          } catch {}
-        }
-        if (created) {
-          try {
-            fs.unlinkSync(tmp); // 只删自己刚建的临时文件
-          } catch {}
-        }
-        throw e;
-      }
+      atomicWriteNew(this.file, JSON.stringify(file), this.pid);
       this.wrote = true;
       this.last = key;
       this.writes++;
@@ -202,22 +180,6 @@ export class TernWriter {
     } catch {}
   }
 
-  /**
-   * 状态目录必须是我们自己的真实目录：lstat 不跟随符号链接，属主是当前用户，权限收紧到 0700。
-   * 不满足就抛错（本次不写）：别人预先放的符号链接或目录会把状态文件引到别处，或让别的用户读写。
-   */
-  private ensureDir(): void {
-    fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    const st = fs.lstatSync(this.dir);
-    if (!st.isDirectory()) throw new Error("状态目录不是真实目录（符号链接或其他类型）");
-    const uid = process.getuid?.();
-    if (uid !== undefined && st.uid !== uid) throw new Error("状态目录的属主不是当前用户");
-    if ((st.mode & 0o777) !== 0o700) {
-      fs.chmodSync(this.dir, 0o700);
-      if ((fs.lstatSync(this.dir).mode & 0o777) !== 0o700) throw new Error("状态目录权限无法收紧到 0700");
-    }
-  }
-
   /** 清掉本目录里 pid 已不存在的状态文件（被杀掉的 omp 留下的）。不碰别的文件，也不碰 pid 活着的。 */
   private sweepStale(): void {
     let names: string[];
@@ -237,5 +199,52 @@ export class TernWriter {
         if (typeof pid === "number" && Number.isInteger(pid) && pid > 0 && !pidAlive(pid)) fs.unlinkSync(f);
       } catch {}
     }
+  }
+}
+
+/**
+ * 目录必须是我们自己的真实目录：lstat 不跟随符号链接，属主是当前用户，权限收紧到 0700。
+ * 不满足就抛错（调用方不写）：别人预先放的符号链接或目录会把写入引到别处，或让别的用户读写。
+ */
+export function ensureOwnDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = fs.lstatSync(dir);
+  if (!st.isDirectory()) throw new Error("目录不是真实目录（符号链接或其他类型）");
+  const uid = process.getuid?.();
+  if (uid !== undefined && st.uid !== uid) throw new Error("目录的属主不是当前用户");
+  if ((st.mode & 0o777) !== 0o700) {
+    fs.chmodSync(dir, 0o700);
+    if ((fs.lstatSync(dir).mode & 0o777) !== 0o700) throw new Error("目录权限无法收紧到 0700");
+  }
+}
+
+/**
+ * 原子写：同目录里用随机名 + 排他创建（wx，0600）写临时文件，再 rename 到目标。
+ * rename 替换的是目标这个目录项本身：目标是（悬空的）符号链接时换掉链接，不会写穿到链接指向的地方。
+ * 失败时只删自己刚建的临时文件。调用方先 ensureOwnDir。
+ */
+export function atomicWriteNew(file: string, content: string, tag: string | number = process.pid): void {
+  const tmp = `${file}.${tag}.${randomBytes(6).toString("hex")}.tmp`;
+  let fd: number | undefined;
+  let created = false;
+  try {
+    fd = fs.openSync(tmp, "wx", 0o600); // 排他创建：已存在的文件或符号链接一律拒绝
+    created = true;
+    fs.writeSync(fd, content);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    if (created) {
+      try {
+        fs.unlinkSync(tmp); // 只删自己刚建的临时文件
+      } catch {}
+    }
+    throw e;
   }
 }

@@ -148,6 +148,9 @@ function pageSize(rows: number): number {
 
 type View = "list" | "detail";
 
+/** 宽度不小于它时给列表行与详情行留 2 列前缀（"› " / 缩进）；再窄就去掉前缀，把列数全留给内容。 */
+const PREFIX_MIN = 6;
+
 /** 原值列表组件：列表层（上下选择）和详情层（原值全文，可滚动）。 */
 export class ValueList {
   #view: View = "list";
@@ -182,7 +185,8 @@ export class ValueList {
   }
 
   render(width: number): string[] {
-    const w = Math.max(20, width);
+    // 按实际宽度画，不放大：放大会让折行后的行比终端还宽，被终端裁掉的字符就再也看不到了
+    const w = Math.max(1, Math.floor(width));
     return this.#view === "list" ? this.#renderList(w) : this.#renderDetail(w);
   }
 
@@ -196,15 +200,17 @@ export class ValueList {
     ];
     const end = Math.min(this.items.length, this.#top + page);
     for (let i = this.#top; i < end; i++) {
-      const text = fit(listLabel(this.items[i]!), w - 2);
-      out.push(i === this.#cur ? this.#fg("accent", `› ${text}`) : `  ${text}`);
+      const pre = w >= PREFIX_MIN ? 2 : 0; // 极窄时去掉 "› " 前缀，只靠着色标出选中项
+      const text = fit(listLabel(this.items[i]!), w - pre);
+      out.push(i === this.#cur ? this.#fg("accent", `${pre ? "› " : ""}${text}`) : `${pre ? "  " : ""}${text}`);
     }
-    out.push(this.#fg("dim", `第 ${this.#cur + 1}/${this.items.length} 项`));
+    out.push(this.#fg("dim", fit(`第 ${this.#cur + 1}/${this.items.length} 项`, w)));
     return out;
   }
 
   #detailLines(w: number): string[] {
-    if (this.#detail?.width !== w) this.#detail = { width: w, lines: wrap(visible(this.items[this.#cur]!.value, true), w - 2) };
+    // 内容宽度 = 终端宽度减去 2 列缩进；窄到放不下缩进时去掉缩进，每个字符仍然都能显示（宽字符在 1 列里单独占一行）
+    if (this.#detail?.width !== w) this.#detail = { width: w, lines: wrap(visible(this.items[this.#cur]!.value, true), w >= PREFIX_MIN ? w - 2 : w) };
     return this.#detail.lines;
   }
 
@@ -218,8 +224,9 @@ export class ValueList {
       this.#bold(fit(detailHeader(it), w)),
       this.#fg("dim", fit(`${scroll ? "↑↓ 滚动 · " : ""}Enter / Esc 返回列表 · 原值只在本机界面显示`, w)),
     ];
-    for (const l of lines.slice(this.#dTop, this.#dTop + page)) out.push(`  ${l}`);
-    if (scroll) out.push(this.#fg("dim", `第 ${this.#dTop + 1}–${Math.min(lines.length, this.#dTop + page)} 行 / 共 ${lines.length} 行`));
+    const indent = w >= PREFIX_MIN ? "  " : "";
+    for (const l of lines.slice(this.#dTop, this.#dTop + page)) out.push(`${indent}${l}`);
+    if (scroll) out.push(this.#fg("dim", fit(`第 ${this.#dTop + 1}–${Math.min(lines.length, this.#dTop + page)} 行 / 共 ${lines.length} 行`, w)));
     return out;
   }
 
