@@ -2,6 +2,8 @@
 -- omp-pii-guard 的 Tern 底栏插件：在运行着 omp（已加载 omp-pii-guard 扩展）的窗格的底栏显示一个可点击的 PII 段。
 -- 点击底栏段（或命令面板“PII Guard：查看遮挡的值”）：向这个窗格的 omp 发快捷键（只发按键，不发文字），
 -- 由 omp 自己在界面里弹出“本会话遮挡的值”列表（完整原值只出现在那个界面里；本插件不读、不写、不经手原值）。
+-- 发之前实时确认（任一不满足就只 toast、不发）：状态文件有效且 list == true（扩展的快捷键没被别的绑定占用）、pid 存活、
+-- 该 pid 在它终端的前台进程组里且没被挂起（ps stat 含 + 不含 T）、Tern 报告这个窗格正是 omp（kind == "agent"，或程序名是 omp）、窗格仍是焦点窗格。
 -- 命令面板“PII Guard：显示遮挡情况”：toast 显示 /pii 的内容（只有计数）。
 --
 -- 数据来源：扩展写的状态文件 <数据目录>/tern/<TERN_PANE>.json（格式见仓库 README 与 src/tern.ts，只含计数与状态）。
@@ -27,6 +29,7 @@ type State = {
 	failed: number,
 	level: string,
 	summary: string,
+	list: boolean,
 	updatedAt: number,
 }
 
@@ -96,6 +99,9 @@ local function validate(data: any, pane: number): State?
 	if chars > MAX_SUMMARY then
 		summary = string.sub(summary, 1, utf8.offset(summary, MAX_SUMMARY + 1) - 1) .. "…"
 	end
+	-- list：扩展的列表快捷键对它可用（已注册且没有别的绑定占着）；可选，缺失当作 false
+	local list = data.list
+	if list ~= nil and type(list) ~= "boolean" then return nil end
 	if type(data.updatedAt) ~= "number" or data.updatedAt ~= data.updatedAt or data.updatedAt < 0 then return nil end
 	return {
 		v = 1,
@@ -109,6 +115,7 @@ local function validate(data: any, pane: number): State?
 		failed = data.failed,
 		level = data.level,
 		summary = summary,
+		list = list == true,
 		updatedAt = data.updatedAt,
 	}
 end
@@ -269,8 +276,19 @@ end
 
 tern.command({ id = "details", title = "PII Guard：显示遮挡情况", icon = "shield", run = details })
 
--- 向焦点窗格的 omp 发快捷键，让它弹出遮挡值列表。发之前：状态文件有效（pid 存活、窗格相符），窗格还在、仍是焦点窗格。
--- 没有这样的窗格（没在跑带 PII 保护的 omp）就只提示，不向任何窗格发输入。
+-- 向焦点窗格的 omp 发快捷键，让它弹出遮挡值列表。发之前（都是此刻现查，不用缓存）要同时满足：
+--   1. 状态文件有效（pid 存活、窗格相符）且 list == true（扩展的列表快捷键可用）；
+--   2. ps 报告这个 pid 的 stat 含 + 且不含 T/Z：在它终端的前台进程组里、没被 Ctrl+Z 挂起、不是僵尸（挂起后 pid 仍活着，
+--      按键却会落到 shell 里）；
+--   3. Tern 报告这个窗格正是 omp：kind == "agent"（Tern 的 omp 原生视图），或前台程序名是 omp（普通终端视图；挂起后 Tern 看到的是 zsh）；
+--   4. 它仍是焦点窗格。
+-- 任一不满足就只提示，不向任何窗格发输入。发出的内容固定为 LIST_KEY_SEQ。
+local function programName(info: PaneInfo): string
+	local p = info.program
+	if type(p) ~= "string" then return "" end
+	return string.match(p, "([^/]+)$") or p
+end
+
 local function openList(cx: WindowCx)
 	local pane = cx.session:focused()
 	if not pane then
@@ -284,8 +302,24 @@ local function openList(cx: WindowCx)
 			c:toast("info", "这个窗格没有运行带 PII 保护的 omp", "需要在窗格里启动加载了 omp-pii-guard 扩展的 omp；只有 Tern 里的 omp 会写状态文件。")
 			return
 		end
-		if c.session:focused() ~= pane or c.session:pane(pane) == nil then return end
-		c:run(pane, LIST_KEY_SEQ)
+		if not s.list then
+			c:toast("info", "在 omp 里输入 /pii list 查看", "列表快捷键没有生效（被别的绑定占用，或 omp 太旧无法确认），所以这里不发按键。")
+			return
+		end
+		tern.process.run({ "/bin/ps", "-o", "stat=", "-p", string.format("%d", s.pid) }, { timeout_ms = 2000 }, function(result, cx3)
+			local c3 = cx3
+			if not c3 then return end
+			local stat = if result.status == 0 then (string.gsub(result.stdout, "%s+", "")) else ""
+			local foreground = stat ~= "" and string.find(stat, "+", 1, true) ~= nil and string.find(stat, "T", 1, true) == nil and string.find(stat, "Z", 1, true) == nil
+			local info = c3.session:pane(pane)
+			local isOmp = info ~= nil and (info.kind == "agent" or programName(info) == "omp")
+			if c3.session:focused() ~= pane or info == nil then return end
+			if not foreground or not isOmp then
+				c3:toast("info", "omp 现在不在这个窗格的前台", "可能被 Ctrl+Z 挂起了，或已退出：用 fg 恢复后再点。没有向窗格发送按键。")
+				return
+			end
+			c3:run(pane, LIST_KEY_SEQ)
+		end)
 	end)
 end
 

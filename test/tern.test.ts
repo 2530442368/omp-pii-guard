@@ -186,7 +186,7 @@ describe("内容", () => {
     expect(s.summary).toContain("人名 1");
     // 不含任何原值、占位符、会话内容
     for (const secret of ["张伟", "13812345678", "zhangwei", "acme-corp", "{{", "}}"]) expect(raw).not.toContain(secret);
-    expect(Object.keys(s).sort()).toEqual(["failed", "kinds", "level", "model", "on", "pane", "pid", "requests", "summary", "updatedAt", "v"]);
+    expect(Object.keys(s).sort()).toEqual(["failed", "kinds", "level", "list", "model", "on", "pane", "pid", "requests", "summary", "updatedAt", "v"]);
   });
 
   test("开关与模型状态", async () => {

@@ -5,14 +5,17 @@
 //   - 映射经 pi.appendEntry 持久化，session_start/branch/tree/switch 时重建。
 // 子代理会话与主会话同进程，模型、缓存、占位符表、网络层包装用 globalThis 单例，只装一次。
 //   - 在 Tern 里运行（有 TERN_PANE）时，把主会话交互界面的状态写成 Tern 状态文件（src/tern.ts），供 tern-plugin/ 的底栏插件显示；内容只含计数与状态。
-//   - /pii list 与快捷键 LIST_KEY：在 omp 自己的界面里列出本会话被遮挡的完整原值（只显示，不进对话、不进模型上下文、不写文件）。
-//     Tern 插件的底栏点击只是向本窗格发这个快捷键，不读写原值。
+//   - /pii list 与快捷键 LIST_KEY：在本机 omp 的 TUI 里（ctx.ui.custom，见 src/list-ui.ts）列出本会话被遮挡的完整原值
+//     （只显示，不进对话、不进模型上下文、不进通知与日志、不写文件；只在 ctx.mode === "tui" 时显示，RPC/打印/协作转发的界面一律不显示）。
+//     Tern 插件的底栏点击只是向本窗格发这个快捷键（状态文件的 list 字段为 true 时才发），不读写原值。
 
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ALL_KINDS, envDisabled, envNoRestore, loadConfig, paths, type Config, type Paths } from "./config.ts";
 import { AstrGuard, Limiter } from "./guard.ts";
 import { LocalLiterals } from "./local.ts";
+import { LIST_MAX_VALUE, openValueList, type ListItem } from "./list-ui.ts";
 import { MaskTimeout, Masker } from "./mask.ts";
 import { detectFormat, formatForApi, maskPayload, type TextItem, type TextMasker } from "./payload.ts";
 import { PH_RE, Placeholders, loadKey, restorePolicy } from "./placeholder.ts";
@@ -27,10 +30,11 @@ export const BPR_BUDGET_MS = 25_000;
 export const NET_BUDGET_MS = 180_000;
 const MAP_ENTRY = "pii-guard.map";
 const VERIFIED_VERSION = /^18\.18\./;
-/** 打开原值列表的快捷键。Tern 插件（tern-plugin/window.luau 的 LIST_KEYS）发的是它的终端编码，两处要一起改。 */
+/** 打开原值列表的快捷键。Tern 插件（tern-plugin/window.luau 的 LIST_KEY_SEQ）发的是它的终端编码（CSI u），两处要一起改。 */
 export const LIST_KEY = "ctrl+alt+p";
-/** 列表里一行最多显示的原值字符数（超出截断，选中后看全文）；再长的话占位符与分数会被弹层的宽度切掉。 */
-export const LIST_MAX_VALUE = 40;
+export { LIST_MAX_VALUE };
+/** 不在交互 TUI 里（RPC、print、json、无界面）打 /pii list 时的固定提示：不含任何值，原值也不会换个方式输出。 */
+const LIST_NEEDS_TUI = "/pii list 需要在 omp 交互界面里查看（原值只在本机界面显示，这里不输出）";
 /** 已确认是 omp 占位符的 $$…$$ 的个数上限（超过淘汰最旧的）。 */
 const MAX_CONFIRMED = 20_000;
 
@@ -65,6 +69,8 @@ interface Runtime {
   versionChecked: boolean;
   /** 在 Tern 里运行（有 TERN_PANE）时的状态文件写入器；否则 undefined。 */
   tern: TernWriter | undefined;
+  /** 列表快捷键对本扩展可用：已注册、且 session_start 时确认没有别的绑定占着它（写进 Tern 状态文件的 list，插件据此决定发不发键）。 */
+  listKey: boolean;
   stats: { bprRequests: number; bprChanged: number; bprFailed: number; bprFallbackToNet: number; netRequests: number; netRefused: number; netChanged: number; failures: number };
 }
 
@@ -98,6 +104,7 @@ function runtime(): Runtime {
     shellsPending: 0,
     setupP: undefined,
     tern: undefined,
+    listKey: false,
   };
   const pane = ternPane();
   if (pane !== undefined) rt.tern = new TernWriter(path.join(p.root, "tern"), pane);
@@ -408,6 +415,7 @@ export default function piiGuard(pi: any): void {
 
   const sessionKickoff = (ctx: any, full: boolean): void => {
     bindNotifier(ctx);
+    if (full) checkListKey(ctx);
     ternClaim(ctx);
     learnOrigins(ctx);
     if (full) {
@@ -419,11 +427,6 @@ export default function piiGuard(pi: any): void {
     if (!isOn(rt)) return;
     if (full) {
       for (const w of rt.config.warnings) notify(rt, w, "warning");
-      // 快捷键被别的绑定占了就不会生效（Tern 底栏点击发的就是它）：提示一次，/pii list 照常可用
-      try {
-        const held = ctx.hasUI ? pi.getShortcutConflict?.(LIST_KEY) : undefined;
-        if (held) notify(rt, `快捷键 ${LIST_KEY} 已被占用（${held.kind}），打不开原值列表（Tern 底栏点击也一样）；请用 /pii list`, "warning");
-      } catch {}
       // 预热模型：加载失败尽早提示
       ctx.setTimeout(async () => {
         try {
@@ -444,13 +447,16 @@ export default function piiGuard(pi: any): void {
   };
 
   // ---- /pii ----
-  // 原值只显示在本机 omp 界面（ctx.ui.select 弹层）：不写通知、不 sendMessage、不写日志与文件。
+  // 原值只显示在本机 omp 的 TUI（src/list-ui.ts 的 ctx.ui.custom 组件）：不写通知、不 sendMessage、不写日志与文件。
+  // 不用 ctx.ui.select：它会转发给协作访客、在 RPC 里写进 extension_ui_request 帧（原值会离开本机界面）。
   let listOpen = false;
   const showList = async (ctx: any): Promise<void> => {
     if (ctx.agent?.kind === "sub") return;
-    if (!ctx.hasUI) {
-      // 无界面模式（-p 等）的 ctx.ui.notify 不会显示：走 stderr；只有这句固定提示，不含任何值
-      console.error("[pii-guard] /pii list 需要交互界面（原值只在本机 omp 界面显示）");
+    if (!ctx.hasUI || ctx.mode !== "tui") {
+      // 只有交互 TUI 才显示原值：RPC/ACP（mode 为 rpc，hasUI 可能为真，界面会转给客户端）、print、json 一律不显示。
+      // 提示是固定的一句、不含任何值：有界面（RPC 客户端）走通知，无界面（-p 等，通知不显示）走 stderr。
+      if (ctx.hasUI) ctx.ui.notify(LIST_NEEDS_TUI, "warning");
+      else console.error(`[pii-guard] ${LIST_NEEDS_TUI}`);
       return;
     }
     if (listOpen) return;
@@ -461,21 +467,49 @@ export default function piiGuard(pi: any): void {
     }
     listOpen = true;
     try {
-      const title = `本会话遮挡的值（${items.length} 个）· 选中看全文`;
-      for (;;) {
-        const labels = new Map(items.map((it) => [listLabel(it), it]));
-        const picked = await ctx.ui.select(title, [...labels.keys()]);
-        const it = picked === undefined ? undefined : labels.get(picked);
-        if (!it) return;
-        await ctx.ui.select(detailTitle(it), ["返回列表"]);
-      }
+      await openValueList(ctx, items);
     } catch (e) {
       notify(rt, `打开原值列表失败：${String((e as Error)?.message ?? e)}`, "warning");
     } finally {
       listOpen = false;
     }
   };
-  pi.registerShortcut(LIST_KEY, { description: "PII Guard：查看本会话遮挡的值", handler: showList });
+  // 快捷键：别的绑定占着它就不注册（omp 在加载阶段不允许查询，所以靠上次 session_start 留下的标记），免得抢占别人的绑定
+  // （同一个键后注册的覆盖先注册的）；Tern 底栏点击发的就是这个键，所以 Tern 状态文件的 list 也跟着它走。
+  const listKeyMarker = path.join(rt.paths.root, "list-key-taken");
+  let keyRegistered = false;
+  try {
+    if (!fs.existsSync(listKeyMarker)) {
+      pi.registerShortcut(LIST_KEY, { description: "PII Guard：查看本会话遮挡的值", handler: showList });
+      keyRegistered = true;
+    }
+  } catch {}
+  /** session_start 里确认列表快捷键归本扩展：没有别的绑定占着它才算可用（rt.listKey）；占着就留标记，下次启动不再注册。 */
+  const checkListKey = (ctx: any): void => {
+    if (!ctx.hasUI || ctx.agent?.kind === "sub" || ctx.mode !== "tui") return;
+    let known = false;
+    let held: { kind?: string } | undefined;
+    try {
+      if (typeof pi.getShortcutConflict === "function") {
+        held = pi.getShortcutConflict(LIST_KEY) ?? undefined;
+        known = true;
+      }
+    } catch {}
+    rt.listKey = keyRegistered && known && !held;
+    if (!known) return;
+    try {
+      if (keyRegistered && held) {
+        fs.mkdirSync(rt.paths.root, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(listKeyMarker, "别的绑定占着列表快捷键时由 pii-guard 写入：存在时启动不注册它；快捷键空闲后启动时自动删除。\n", { mode: 0o600 });
+        notify(rt, `快捷键 ${LIST_KEY} 已被占用（${held.kind ?? "未知"}），本扩展的列表快捷键与 Tern 底栏点击暂不可用，请用 /pii list；下次启动起本扩展不再注册这个键，不抢占别人的绑定`, "warning");
+      } else if (!keyRegistered && !held) {
+        fs.rmSync(listKeyMarker, { force: true });
+        notify(rt, `快捷键 ${LIST_KEY} 已空闲，重启 omp 后恢复列表快捷键与 Tern 底栏点击；现在可用 /pii list`, "info");
+      }
+    } catch (e) {
+      pi.logger?.debug?.(`[pii-guard] 列表快捷键标记读写失败：${String((e as Error)?.message ?? e)}`);
+    }
+  };
 
   pi.registerCommand("pii", {
     description: "PII Guard 状态；/pii list 查看遮挡的值；/pii setup 准备模型；/pii on|off 开关",
@@ -673,41 +707,16 @@ export function hidePartialPlaceholder(text: string): string {
 const KIND_ZH: Record<Kind, string> = { PERSON: "人名", ADDRESS: "地址", PHONE: "手机", EMAIL: "邮箱", ACCOUNT: "账号", SECRET: "密码" };
 const DEFAULT_THRESHOLD = 0.8;
 
-/** 列表里的一项：本会话遮挡过的一个值。 */
-interface ListedValue {
-  kind: Kind;
-  ph: string;
-  value: string;
-  score: number;
-}
-
 /** 本会话遮挡过的值：与 /pii 的计数同源（`used`：本会话出现过的占位符），原值与分数取自占位符表。按类别分组，组内按首次出现的顺序。 */
-function listValues(rt: Runtime, used: ReadonlyMap<Kind, ReadonlySet<string>>): ListedValue[] {
-  const out: ListedValue[] = [];
+function listValues(rt: Runtime, used: ReadonlyMap<Kind, ReadonlySet<string>>): ListItem[] {
+  const out: ListItem[] = [];
   for (const kind of ALL_KINDS) {
     for (const ph of used.get(kind) ?? []) {
       const value = rt.ph.lookup(ph);
-      if (value !== undefined) out.push({ kind, ph, value, score: rt.ph.scoreOf(ph) });
+      if (value !== undefined) out.push({ kind: KIND_ZH[kind], ph, value, score: rt.ph.scoreOf(ph) });
     }
   }
   return out;
-}
-
-/** 原值里的控制字符（含 ESC 序列的起头）换成可见的控制图片符，别让它在终端里被当成指令；`keepLines` 时保留换行与制表符。 */
-function visible(s: string, keepLines: boolean): string {
-  return s.replace(keepLines ? /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g : /[\u0000-\u001f\u007f-\u009f]/g, (c) => (c.charCodeAt(0) <= 0x20 ? String.fromCharCode(0x2400 + c.charCodeAt(0)) : "\u2426"));
-}
-
-/** 列表里的一行：类别 · 原值（过长截断）· 占位符 · 分数。占位符唯一，所以每行都不同。 */
-function listLabel(it: ListedValue): string {
-  const chars = [...it.value];
-  const v = visible(chars.length > LIST_MAX_VALUE ? `${chars.slice(0, LIST_MAX_VALUE).join("")}…` : it.value, false);
-  return `${KIND_ZH[it.kind]} · ${v} · ${it.ph} · ${it.score.toFixed(2)}`;
-}
-
-/** 选中一项后的完整原值（标题里：第一行是类别、占位符、分数，其后是原值全文）。 */
-function detailTitle(it: ListedValue): string {
-  return `${KIND_ZH[it.kind]} · ${it.ph} · 识别分数 ${it.score.toFixed(2)}\n${visible(it.value, true)}`;
 }
 
 /**
@@ -739,7 +748,7 @@ function status(rt: Runtime, used: ReadonlyMap<Kind, ReadonlySet<string>>): { te
   const tern = (on: boolean, off: TernBody["off"], text: string, level: Level): { text: string; level: Level; tern: TernBody } => ({
     text,
     level,
-    tern: { on, ...(off ? { off } : {}), model, kinds, requests, failed: rt.stats.failures, level, summary: text },
+    tern: { on, ...(off ? { off } : {}), model, kinds, requests, failed: rt.stats.failures, level, summary: text, list: rt.listKey },
   });
   if (envDisabled()) return tern(false, "env", "PII 保护已关闭（OMP_PII_GUARD=off，去掉环境变量并重启 omp 才能开启）· 请求将原样发出", "info");
   if (rt.userOff) return tern(false, "user", `PII 保护已关闭（/pii off）· 请求将原样发出${rt.noRestore ? " · 还原已关闭（PII_GUARD_NO_RESTORE，测试用）" : "，回复中的占位符仍会还原"}`, "info");

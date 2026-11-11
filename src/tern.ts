@@ -44,6 +44,8 @@ export interface TernBody {
   level: "info" | "warning";
   /** 与 /pii 相同的单行中文摘要。 */
   summary: string;
+  /** 列表快捷键对本扩展可用（已注册且没有别的绑定占着它）：插件只在它为 true 时向窗格发快捷键，否则提示用 /pii list。 */
+  list: boolean;
 }
 
 export interface TernFile extends TernBody {

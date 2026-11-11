@@ -1,4 +1,4 @@
-// /pii list 与快捷键：在 omp 自己的界面（ctx.ui.select）里列出本会话遮挡过的完整原值。
+// /pii list 与快捷键：在本机 omp 的 TUI（ctx.ui.custom 组件，src/list-ui.ts）里列出本会话遮挡过的完整原值。
 // 按“场景矩阵”覆盖：内容（六类中英文、同类多值、重复值、2 字中文名、特殊字符、超长值、像占位符的文本、已知值补遮）、
 // 来源（用户输入、工具结果、工具调用参数、助手回复、system、子代理、网络层）、会话与状态（空会话、/new、恢复、branch/tree、压缩、
 // off/on、模型不可用、阈值、多会话、无 UI、大量值）、隐私（原值不进通知/日志/对话/状态文件/会话条目）。
@@ -11,6 +11,7 @@ import * as path from "node:path";
 import piiGuard, { LIST_KEY, LIST_MAX_VALUE, testHooks } from "../src/index.ts";
 import { Masker } from "../src/mask.ts";
 import { PH_RE } from "../src/placeholder.ts";
+import { ValueList, columns, detailHeader, fit, listLabel, openValueList, visible, wrap, type ListItem } from "../src/list-ui.ts";
 import { FakeRecognizer } from "./fake.ts";
 
 type Handler = (event: any, ctx: any) => any;
@@ -93,26 +94,124 @@ interface Shown {
 }
 type Answer = (options: string[]) => string | undefined;
 
+/** 列表组件的宽度：够宽，列表行和详情都不折行/截断（折行与截断另有专门的用例）。 */
+const WIDE = 4000;
+/** 假的 keybindings：tui.select.* 对应的终端按键序列。 */
+const KEYS: Record<string, string> = {
+  "tui.select.up": "\x1b[A",
+  "tui.select.down": "\x1b[B",
+  "tui.select.pageUp": "\x1b[5~",
+  "tui.select.pageDown": "\x1b[6~",
+  "tui.select.confirm": "\r",
+  "tui.select.cancel": "\x1b",
+};
+const kb = { matches: (data: string, id: string) => KEYS[id] === data };
+const UP = KEYS["tui.select.up"]!;
+const DOWN = KEYS["tui.select.down"]!;
+const ENTER = KEYS["tui.select.confirm"]!;
+const ESC = KEYS["tui.select.cancel"]!;
+const plainTheme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+
+interface ListComponent {
+  render(width: number): readonly string[];
+  handleInput(data: string): void;
+}
+
+/** 造一个 tui（终端行数可调）和 done 记录，调 factory 得到真实的列表组件。 */
+async function mountList(factory: any, over: { rows?: number; theme?: unknown } = {}) {
+  const state = { closed: false, repaints: 0 };
+  const tui = { terminal: { rows: over.rows ?? 30, columns: WIDE }, requestRender: () => void state.repaints++ };
+  const comp = (await factory(tui, "theme" in over ? over.theme : plainTheme, kb, () => void (state.closed = true))) as ListComponent;
+  return { comp, state, tui };
+}
+
+/** 列表层当前选中的行（去掉前缀 "› "）。 */
+function selectedRow(frame: readonly string[]): string {
+  const row = frame.find((r) => r.startsWith("› "));
+  if (!row) throw new Error("没有选中行：" + frame.join(" | "));
+  return row.slice(2);
+}
+const footerPos = (frame: readonly string[]) => /^第 (\d+)\/(\d+) 项$/.exec(frame.at(-1)!)!;
+
+/** 逐项向下走一遍，收集列表里全部项的文本（一屏放不下时靠滚动）；走完回到第一项。 */
+function collectOptions(comp: ListComponent): string[] {
+  const total = Number(footerPos(comp.render(WIDE))[2]);
+  for (let i = 1; i < total; i++) comp.handleInput(UP); // 从第一项起
+  const first = comp.render(WIDE);
+  const options = [selectedRow(first)];
+  for (let i = 1; i < total; i++) {
+    comp.handleInput(DOWN);
+    options.push(selectedRow(comp.render(WIDE)));
+  }
+  for (let i = 1; i < total; i++) comp.handleInput(UP);
+  return options;
+}
+
+/** 详情层：标题行 + 全部原值行（一屏放不下时逐屏滚动）；格式与旧版 select 的标题一致（第一行标题，其后是原值全文）。 */
+function collectDetail(comp: ListComponent): string {
+  let frame = comp.render(WIDE);
+  const head = frame[0]!;
+  const body = (f: readonly string[]) => f.slice(2).filter((r) => !/^第 \d+–\d+ 行 \/ 共 \d+ 行$/.test(r)).map((r) => r.slice(2));
+  const lines = body(frame);
+  for (let guard = 0; guard < 1000; guard++) {
+    const m = /^第 (\d+)–(\d+) 行 \/ 共 (\d+) 行$/.exec(frame.at(-1)!);
+    if (!m || Number(m[2]) >= Number(m[3])) break;
+    for (let i = 0; i < 20; i++) comp.handleInput(DOWN);
+    frame = comp.render(WIDE);
+    const got = body(frame);
+    const known = Number(m[2]);
+    lines.push(...got.slice(Math.max(0, got.length - (Number(/^第 \d+–(\d+)/.exec(frame.at(-1)!)![1]) - known))));
+  }
+  return [head, ...lines].join("\n");
+}
+
 function makeCtx(over: Record<string, any> = {}) {
   const notes: { msg: string; level: string }[] = [];
   const shown: Shown[] = [];
   const answers: Answer[] = [];
   const branch: any[] = over.branch ?? [];
+  /** 不走 ctx.ui.custom 的对话框原语（select、confirm、input、editor）一旦被调用就记下：它们会转发给协作访客/RPC 客户端，列表绝不能用。 */
+  const forbidden: string[] = [];
+  const forbid = (name: string) => async () => {
+    forbidden.push(name);
+    return undefined;
+  };
   const ctx = {
     model: { api: "anthropic-messages", baseUrl: "https://api.anthropic.com" },
+    mode: "tui",
     hasUI: true,
     ui: {
       notify: (msg: string, level: string) => notes.push({ msg, level }),
-      select: async (title: string, options: string[]) => {
-        shown.push({ title, options: [...options] });
-        return answers.shift()?.(options);
+      select: forbid("select"),
+      confirm: forbid("confirm"),
+      input: forbid("input"),
+      editor: forbid("editor"),
+      /** 像 omp 的 showHookCustom 那样：调 factory 得到组件，之后按键驱动它；按 answers 依次“选”。 */
+      custom: async (factory: any) => {
+        const { comp, state } = await mountList(factory);
+        for (let guard = 0; guard < 200 && !state.closed; guard++) {
+          const options = collectOptions(comp);
+          shown.push({ title: comp.render(WIDE)[0]!, options });
+          const picked = answers.shift()?.(options);
+          const idx = picked === undefined ? -1 : options.indexOf(picked);
+          if (idx < 0) {
+            comp.handleInput(ESC); // 列表层 Esc：关闭
+            continue;
+          }
+          for (let i = 0; i < idx; i++) comp.handleInput(DOWN);
+          comp.handleInput(ENTER);
+          shown.push({ title: collectDetail(comp), options: ["返回列表"] });
+          answers.shift(); // 详情层的“回答”只用来保持节奏：不管给什么都回到列表
+          comp.handleInput(ENTER);
+        }
+        expect(state.closed).toBe(true);
       },
     },
     sessionManager: { getBranch: () => branch },
     setTimeout: (fn: () => unknown, ms: number) => setTimeout(() => void Promise.resolve(fn()).catch(() => {}), ms),
     ...over,
   };
-  return { ctx, notes, shown, answers, branch };
+  return { ctx, notes, shown, answers, branch, forbidden };
 }
 
 const body = (content: unknown, extra: Record<string, unknown> = {}) => ({ model: "claude", max_tokens: 10, messages: [{ role: "user", content }], ...extra });
@@ -300,7 +399,7 @@ describe("基本：内容与格式", () => {
     answers.push(pick("地址"), () => undefined, pick("密码"), () => undefined, () => undefined);
     await t.list(ctx);
     const addrDetail = shown[1]!.title;
-    expect(addrDetail).toContain(nl); // 换行与制表原样保留
+    expect(addrDetail).toContain(nl.replace("\t", "    ")); // 换行保留；制表按 4 个空格显示（制表符的列宽不定，会弄乱对齐）
     const pwdDetail = shown[3]!.title;
     expect(pwdDetail).not.toMatch(/[\u001b\u0007]/);
     expect(pwdDetail).toContain("\u241b"); // ESC → ␛
@@ -577,8 +676,8 @@ describe("会话与状态", () => {
     const { ctx, shown } = makeCtx();
     await send(t, ctx, userText(`手机 ${V.zhPhone}`));
     const gate = Promise.withResolvers<string | undefined>();
-    ctx.ui.select = async (title: string, options: string[]) => {
-      shown.push({ title, options: [...options] });
+    ctx.ui.custom = async () => {
+      shown.push({ title: "", options: [] });
       return gate.promise;
     };
     const first = t.list(ctx);
@@ -589,9 +688,8 @@ describe("会话与状态", () => {
     gate.resolve(undefined);
     await first;
     // 关闭后可再次打开
-    ctx.ui.select = async (title: string, options: string[]) => {
-      shown.push({ title, options: [...options] });
-      return undefined;
+    ctx.ui.custom = async () => {
+      shown.push({ title: "", options: [] });
     };
     await t.list(ctx);
     expect(shown.length).toBe(2);
@@ -825,7 +923,7 @@ describe("无界面与隐私", () => {
     expect(noUi.shown.length).toBe(0);
     expect(noUi.notes.length).toBe(0); // 无界面时通知不会显示，提示走 stderr
     expect(errs.length).toBe(2);
-    for (const e of errs) expect(e).toBe("[pii-guard] /pii list 需要交互界面（原值只在本机 omp 界面显示）");
+    for (const e of errs) expect(e).toBe("[pii-guard] /pii list 需要在 omp 交互界面里查看（原值只在本机界面显示，这里不输出）");
     const everything = [...noUi.notes.map((n) => n.msg), ...errs, ...t.debug].join("\n");
     for (const v of Object.values(V)) expect(everything).not.toContain(v);
   });
@@ -862,7 +960,7 @@ describe("无界面与隐私", () => {
     piiGuard(t.pi);
     const { ctx, shown, notes } = makeCtx();
     await send(t, ctx, userText(`手机 ${V.zhPhone}`));
-    ctx.ui.select = async () => {
+    ctx.ui.custom = async () => {
       throw new Error("渲染失败");
     };
     await t.list(ctx);
@@ -870,9 +968,8 @@ describe("无界面与隐私", () => {
     expect(warn.level).toBe("warning");
     expect(warn.msg).toContain("打开原值列表失败");
     expect(warn.msg).not.toContain(V.zhPhone);
-    ctx.ui.select = async (title: string, options: string[]) => {
-      shown.push({ title, options: [...options] });
-      return undefined;
+    ctx.ui.custom = async () => {
+      shown.push({ title: "", options: [] });
     };
     await t.list(ctx);
     expect(shown.length).toBe(1);
@@ -923,11 +1020,509 @@ describe("Tern 状态文件契约不变", () => {
     const file = path.join(ternDir, "7.json");
     const text = fs.readFileSync(file, "utf8");
     const j = JSON.parse(text);
-    expect(Object.keys(j).sort()).toEqual(["failed", "kinds", "level", "model", "on", "pane", "pid", "requests", "summary", "updatedAt", "v"].sort());
+    expect(Object.keys(j).sort()).toEqual(["failed", "kinds", "level", "list", "model", "on", "pane", "pid", "requests", "summary", "updatedAt", "v"].sort());
+    expect(j.list).toBe(true); // 快捷键没有被占：插件可以发键
     expect(j.kinds).toEqual({ PERSON: 3, ADDRESS: 2, PHONE: 2, EMAIL: 2, ACCOUNT: 2, SECRET: 2 });
     for (const v of Object.values(V)) expect(text).not.toContain(v);
     expect(text).not.toMatch(PH_RE);
     for (const ph of masked.matchAll(PH_RE)) expect(text).not.toContain(ph[0]);
     expect(shown.length).toBeGreaterThan(0);
+  });
+});
+
+// ---- 以下为界面组件、显示边界（RPC/协作）、快捷键占用与文本中和 ----
+
+const item = (over: Partial<ListItem> = {}): ListItem => ({ kind: "人名", ph: "{{PERSON_aaaaaaaa}}", value: "张三丰", score: 0.99, ...over });
+const env = (over: Record<string, unknown> = {}) => {
+  const calls = { closed: 0, repaints: 0 };
+  return {
+    calls,
+    env: { rows: () => 30, theme: plainTheme, kb, close: () => void calls.closed++, repaint: () => void calls.repaints++, ...over },
+  };
+};
+
+describe("显示边界：只在本机 TUI，不经协作/RPC", () => {
+  test("交互 TUI 里只用 ctx.ui.custom：select/confirm/input/editor 一次都没调用（它们会转发给协作访客或写进 RPC 帧）", async () => {
+    fresh();
+    const t = makePi();
+    piiGuard(t.pi);
+    const { ctx, shown, notes, answers, forbidden } = makeCtx();
+    await send(t, ctx, userText(ALL_TEXT));
+    answers.push((o) => o[0], () => undefined, () => undefined);
+    await t.list(ctx);
+    await t.shortcuts.get(LIST_KEY)!.handler(ctx);
+    expect(shown.length).toBeGreaterThan(0);
+    expect(forbidden).toEqual([]);
+    expect(notes).toEqual([]);
+  });
+
+  test("协作访客：模拟 omp 的 showCollabAwareSelector——select 的内容会转给访客；列表走 custom，访客帧里没有任何原值", async () => {
+    fresh();
+    const t = makePi();
+    piiGuard(t.pi);
+    const { ctx, answers } = makeCtx();
+    const guestFrames: unknown[] = [];
+    const mirror = (kind: string) => async (...args: unknown[]) => {
+      guestFrames.push({ kind, args }); // omp：host.requestGuestUi(request) 把 title/options 发给可写访客
+      return undefined;
+    };
+    ctx.ui = { ...ctx.ui, select: mirror("select"), confirm: mirror("confirm"), input: mirror("input"), editor: mirror("editor") } as typeof ctx.ui;
+    await send(t, ctx, userText(ALL_TEXT));
+    answers.push((o) => o[0], () => undefined, () => undefined);
+    await t.list(ctx);
+    expect(guestFrames).toEqual([]);
+    expect(JSON.stringify(guestFrames)).not.toContain(V.zhPhone);
+  });
+
+  test("RPC 客户端：模拟 rpc-mode 的 ui（dialog 与 notify 写成 extension_ui_request 帧，custom 是空操作）——命令与快捷键都不显示原值，帧里只有固定的提示", async () => {
+    fresh();
+    const t = makePi();
+    piiGuard(t.pi);
+    const frames: any[] = [];
+    const rpcUi = {
+      select: async (title: string, options: string[]) => void frames.push({ type: "extension_ui_request", method: "select", title, options }),
+      confirm: async (title: string, message: string) => void frames.push({ type: "extension_ui_request", method: "confirm", title, message }),
+      input: async (title: string) => void frames.push({ type: "extension_ui_request", method: "input", title }),
+      editor: async (title: string, prefill?: string) => void frames.push({ type: "extension_ui_request", method: "editor", title, prefill }),
+      notify: (message: string, notifyType: string) => void frames.push({ type: "extension_ui_request", method: "notify", message, notifyType }),
+      custom: async () => undefined,
+    };
+    const rpc = makeCtx({ mode: "rpc", hasUI: true, ui: rpcUi });
+    await send(t, rpc.ctx, userText(ALL_TEXT));
+    frames.length = 0;
+    await t.list(rpc.ctx);
+    await t.shortcuts.get(LIST_KEY)!.handler(rpc.ctx);
+    expect(frames.length).toBe(2);
+    for (const f of frames) {
+      expect(f.method).toBe("notify");
+      expect(f.message).toBe("/pii list 需要在 omp 交互界面里查看（原值只在本机界面显示，这里不输出）");
+      expect(f.notifyType).toBe("warning");
+    }
+    const wire = JSON.stringify(frames);
+    for (const v of Object.values(V)) expect(wire).not.toContain(v);
+  });
+
+  test("mode 不是 tui（rpc、print、json）或缺失：不显示、不调任何 ui 原语；无界面走 stderr，有界面走固定提示的通知", async () => {
+    fresh();
+    const t = makePi();
+    piiGuard(t.pi);
+    await send(t, makeCtx().ctx, userText(ALL_TEXT));
+    const errs: string[] = [];
+    const orig = console.error;
+    console.error = (...a: unknown[]) => void errs.push(a.join(" "));
+    try {
+      for (const over of [{ mode: "rpc" }, { mode: "print" }, { mode: "json" }, { mode: undefined }, { mode: "print", hasUI: false }, { mode: "json", hasUI: false }]) {
+        const c = makeCtx(over);
+        await t.list(c.ctx);
+        expect(c.shown).toEqual([]);
+        expect(c.forbidden).toEqual([]);
+        const withUi = (over as { hasUI?: boolean }).hasUI !== false;
+        expect(c.notes.length).toBe(withUi ? 1 : 0);
+      }
+    } finally {
+      console.error = orig;
+    }
+    expect(errs.length).toBe(2);
+    for (const v of Object.values(V)) expect(errs.join("\n")).not.toContain(v);
+  });
+
+  test("源码守卫：列表代码（src/index.ts、src/list-ui.ts）里没有 ui.select/confirm/input/editor 调用", () => {
+    for (const f of ["../src/index.ts", "../src/list-ui.ts"]) {
+      // 去掉块注释、整行注释和行尾注释再查（注释里会解释为什么不用 select）
+      const src = fs
+        .readFileSync(path.join(import.meta.dir, f), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/^\s*\/\/.*$/gm, "")
+        .replace(/\s\/\/ .*$/gm, "");
+      expect(src).not.toMatch(/\bui\??\.(select|confirm|input|editor)\b/);
+    }
+  });
+
+  test("openValueList 只调 ctx.ui.custom 一次、不带 overlay 选项以外的东西；关闭后 Promise 完成", async () => {
+    const calls: unknown[][] = [];
+    const ctx = {
+      ui: {
+        custom: async (factory: any, ...rest: unknown[]) => {
+          calls.push(rest);
+          const { comp, state } = await mountList(factory);
+          comp.handleInput(ESC);
+          expect(state.closed).toBe(true);
+        },
+      },
+    };
+    await openValueList(ctx, [item()]);
+    expect(calls.length).toBe(1);
+  });
+});
+
+describe("列表组件", () => {
+  test("每一行都不超过终端宽度（CJK 与 emoji 占 2 列），过长的行以 … 结尾", () => {
+    const items = [
+      item({ value: "中".repeat(30) }),
+      item({ ph: "{{PERSON_bbbbbbbb}}", value: "Zoë O'Brien 😀🎉 and a very long english name that goes on" }),
+    ];
+    for (const width of [20, 30, 60, 100]) {
+      const { env: e } = env();
+      const c = new ValueList(items, e);
+      const frame = c.render(width);
+      for (const row of frame) expect(columns(row)).toBeLessThanOrEqual(width);
+      c.handleInput(ENTER);
+      for (const row of c.render(width)) expect(columns(row)).toBeLessThanOrEqual(width);
+    }
+    expect(columns("中a😀")).toBe(5);
+    expect(fit("中文字符串", 6)).toBe("中文…");
+    expect(fit("abc", 3)).toBe("abc");
+  });
+
+  test("上下、翻页、到头不越界；一屏放不下时滚动，选中行始终在屏内，页脚显示位置", () => {
+    const items = Array.from({ length: 50 }, (_, i) => item({ ph: `{{PERSON_${String(i).padStart(8, "a")}}}`, value: `值${i}` }));
+    const { env: e, calls } = env({ rows: () => 12 }); // 一屏 5 项
+    const c = new ValueList(items, e);
+    const frame = () => c.render(WIDE);
+    expect(frame().length).toBe(2 + 5 + 1);
+    expect(footerPos(frame()).slice(1)).toEqual(["1", "50"]);
+    c.handleInput(UP); // 到头
+    expect(footerPos(frame())[1]).toBe("1");
+    for (let i = 0; i < 7; i++) c.handleInput(DOWN);
+    expect(footerPos(frame())[1]).toBe("8");
+    expect(selectedRow(frame())).toContain("值7");
+    expect(frame().join("\n")).toContain("值7");
+    expect(frame().join("\n")).not.toContain("值0 "); // 已滚出屏
+    c.handleInput(KEYS["tui.select.pageDown"]!);
+    expect(footerPos(frame())[1]).toBe("13");
+    for (let i = 0; i < 100; i++) c.handleInput(DOWN);
+    expect(footerPos(frame())[1]).toBe("50");
+    expect(selectedRow(frame())).toContain("值49");
+    for (let i = 0; i < 20; i++) c.handleInput(KEYS["tui.select.pageUp"]!);
+    expect(footerPos(frame())[1]).toBe("1");
+    expect(calls.repaints).toBeGreaterThan(0);
+  });
+
+  test("Enter 看全文、Esc 层级：详情里 Esc/Enter 回到列表（不关闭），列表里 Esc 才关闭", () => {
+    const { env: e, calls } = env();
+    const c = new ValueList([item({ value: "完整原值甲" }), item({ ph: "{{PERSON_bbbbbbbb}}", value: "完整原值乙" })], e);
+    c.handleInput(DOWN);
+    c.handleInput(ENTER);
+    const detail = c.render(WIDE);
+    expect(detail[0]).toBe("人名 · {{PERSON_bbbbbbbb}} · 识别分数 0.99");
+    expect(detail.join("\n")).toContain("完整原值乙");
+    expect(detail.join("\n")).not.toContain("完整原值甲");
+    c.handleInput(ESC);
+    expect(calls.closed).toBe(0);
+    expect(footerPos(c.render(WIDE))[1]).toBe("2"); // 回到列表，光标还在原处
+    c.handleInput(ENTER);
+    c.handleInput(ENTER);
+    expect(calls.closed).toBe(0);
+    c.handleInput(ESC);
+    expect(calls.closed).toBe(1);
+  });
+
+  test("未识别的按键被忽略：不重绘、状态不变", () => {
+    const { env: e, calls } = env();
+    const c = new ValueList([item()], e);
+    const before = c.render(WIDE).join("\n");
+    for (const k of ["x", "q", "\x1b[Z", "\x1b[C"]) c.handleInput(k);
+    expect(calls.repaints).toBe(0);
+    expect(c.render(WIDE).join("\n")).toBe(before);
+  });
+
+  test("详情：多行长值可滚动，逐屏看全，到头不越界；行数在页脚", () => {
+    const value = Array.from({ length: 60 }, (_, i) => `第${i + 1}行内容`).join("\n");
+    const { env: e } = env({ rows: () => 20 }); // 一屏 12 行
+    const c = new ValueList([item({ value })], e);
+    c.handleInput(ENTER);
+    let f = c.render(WIDE);
+    expect(f.at(-1)).toBe("第 1–12 行 / 共 60 行");
+    expect(f.join("\n")).toContain("第1行内容");
+    expect(f.join("\n")).not.toContain("第13行内容");
+    c.handleInput(KEYS["tui.select.pageDown"]!);
+    f = c.render(WIDE);
+    expect(f.at(-1)).toBe("第 13–24 行 / 共 60 行");
+    for (let i = 0; i < 20; i++) c.handleInput(KEYS["tui.select.pageDown"]!);
+    f = c.render(WIDE);
+    expect(f.at(-1)).toBe("第 49–60 行 / 共 60 行");
+    expect(f.join("\n")).toContain("第60行内容");
+    for (let i = 0; i < 100; i++) c.handleInput(UP);
+    expect(c.render(WIDE).at(-1)).toBe("第 1–12 行 / 共 60 行");
+  });
+
+  test("详情：窄终端按列数折行，各行拼回去恰好是原值（含 CJK、emoji）；每行不超过宽度", () => {
+    const value = "地址是北京市朝阳区建国路88号 Building 3, Room 1203, Kexing Science Park 😀 深圳市南山区科技园科苑路15号".repeat(3);
+    const { env: e } = env({ rows: () => 1000 });
+    const c = new ValueList([item({ kind: "地址", value })], e);
+    c.handleInput(ENTER);
+    const width = 40;
+    const lines = c.render(width).slice(2).map((r) => r.slice(2));
+    expect(lines.length).toBeGreaterThan(3);
+    for (const l of lines) expect(columns(l)).toBeLessThanOrEqual(width - 2);
+    expect(lines.join("")).toBe(value);
+    expect(wrap("ab\ncd", 10)).toEqual(["ab", "cd"]);
+    expect(wrap("", 10)).toEqual([""]);
+  });
+
+  test("主题着色出错（theme.fg 抛错）时回落成纯文本，不影响显示", () => {
+    const { env: e } = env({ theme: { fg: () => { throw new Error("坏主题"); }, bold: () => { throw new Error("坏主题"); } } });
+    const c = new ValueList([item()], e);
+    expect(c.render(80).join("\n")).toContain("张三丰");
+    const { env: e2 } = env({ theme: undefined });
+    expect(new ValueList([item()], e2).render(80).join("\n")).toContain("张三丰");
+  });
+
+  test("真实主题给的着色（带 ANSI）不影响内容：去掉 ANSI 后与纯文本一致", () => {
+    const ansi = { fg: (_c: string, s: string) => `\x1b[36m${s}\x1b[39m`, bold: (s: string) => `\x1b[1m${s}\x1b[22m` };
+    const a = new ValueList([item()], env({ theme: ansi }).env).render(80);
+    const b = new ValueList([item()], env().env).render(80);
+    expect(a.map((r) => r.replace(/\x1b\[[0-9;]*m/g, ""))).toEqual([...b]);
+  });
+
+  test("listLabel / detailHeader 的格式", () => {
+    expect(listLabel(item())).toBe("人名 · 张三丰 · {{PERSON_aaaaaaaa}} · 0.99");
+    expect(detailHeader(item({ score: 1 }))).toBe("人名 · {{PERSON_aaaaaaaa}} · 识别分数 1.00");
+  });
+});
+
+describe("文本中和：控制字符、零宽、双向控制符", () => {
+  const cases: [string, number][] = [
+    ["零宽空格 U+200B", 0x200b],
+    ["零宽非连接符 U+200C", 0x200c],
+    ["零宽连接符 U+200D", 0x200d],
+    ["从左到右标记 U+200E", 0x200e],
+    ["从右到左标记 U+200F", 0x200f],
+    ["双向嵌入 U+202A", 0x202a],
+    ["双向嵌入 U+202B", 0x202b],
+    ["双向弹出 U+202C", 0x202c],
+    ["从左到右覆盖 U+202D", 0x202d],
+    ["从右到左覆盖 U+202E", 0x202e],
+    ["词连接符 U+2060", 0x2060],
+    ["函数应用 U+2061", 0x2061],
+    ["不可见乘号 U+2062", 0x2062],
+    ["不可见分隔符 U+2063", 0x2063],
+    ["不可见加号 U+2064", 0x2064],
+    ["双向隔离 U+2066", 0x2066],
+    ["双向隔离 U+2067", 0x2067],
+    ["双向隔离 U+2068", 0x2068],
+    ["双向隔离弹出 U+2069", 0x2069],
+    ["字节序标记 U+FEFF", 0xfeff],
+    ["阿拉伯字母标记 U+061C", 0x061c],
+    ["行分隔符 U+2028", 0x2028],
+    ["段分隔符 U+2029", 0x2029],
+    ["软连字符 U+00AD", 0x00ad],
+    ["DEL U+007F", 0x7f],
+    ["C1 控制符 U+009B（CSI）", 0x9b],
+    ["C1 控制符 U+0085", 0x85],
+  ];
+  for (const [name, cp] of cases) {
+    test(`${name}：visible 转成 ⟨U+XXXX⟩，列表行与详情里都不出现原字符`, () => {
+      const ch = String.fromCodePoint(cp);
+      const esc = `⟨U+${cp.toString(16).toUpperCase().padStart(4, "0")}⟩`;
+      expect(visible(`a${ch}b`, false)).toBe(`a${esc}b`);
+      expect(visible(`a${ch}b`, true)).toBe(`a${esc}b`);
+      const it = item({ value: `pay${ch}ment 123` });
+      const label = listLabel(it);
+      expect(label).toContain(esc);
+      expect(label).not.toContain(ch);
+      const { env: e } = env();
+      const c = new ValueList([it], e);
+      expect(c.render(80).join("\n")).not.toContain(ch);
+      c.handleInput(ENTER);
+      const detail = c.render(80).join("\n");
+      expect(detail).toContain(esc);
+      expect(detail).not.toContain(ch);
+    });
+  }
+
+  test("RTL 覆盖不能把后面的字符倒过来显示：整串里的 U+202E 都被换成可见转义", () => {
+    const v = "密码:\u202e1234\u202c结束";
+    const shown = visible(v, true);
+    expect(shown).toBe("密码:⟨U+202E⟩1234⟨U+202C⟩结束");
+    expect(/[\u202a-\u202e\u2066-\u2069]/.test(shown)).toBe(false);
+  });
+
+  test("C0 控制符换成控制图片符（ESC → ␛、BEL → ␇、NUL → ␀）；详情里保留换行与制表，列表行里连换行制表也换掉", () => {
+    expect(visible("a\u001bb\u0007c\u0000", false)).toBe("a\u241bb\u2407c\u2400");
+    expect(visible("a\nb\tc", true)).toBe("a\nb\tc");
+    expect(visible("a\nb\tc", false)).toBe("a\u240ab\u2409c");
+  });
+
+  test("普通字符不被改动：中文、英文、emoji、ZWJ 以外的组合标记、全角标点", () => {
+    const v = "张三丰 Zoë 😀 ｆｕｌｌ，。";
+    expect(visible(v, false)).toBe(v);
+  });
+});
+
+describe("列表快捷键：不抢占别人的绑定；Tern 状态文件的 list 字段", () => {
+  const marker = () => path.join(dir, "list-key-taken");
+  const readList = async (pane: number): Promise<boolean | undefined> => {
+    const rt = testHooks.runtime();
+    for (let i = 0; i < 400 && rt.tern?.pending; i++) await Bun.sleep(5);
+    await Bun.sleep(20);
+    return JSON.parse(fs.readFileSync(path.join(ternDir, `${pane}.json`), "utf8")).list;
+  };
+  const keyNotes = (notes: { msg: string; level: string }[]) => notes.filter((n) => n.msg.includes("快捷键"));
+
+  test("没人占用：注册快捷键，状态文件 list = true，没有提示、没有标记文件", async () => {
+    process.env.TERN_PANE = "7";
+    fresh();
+    const t = makePi();
+    piiGuard(t.pi);
+    expect(t.shortcuts.has(LIST_KEY)).toBe(true);
+    const { ctx, notes } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    expect(testHooks.runtime().listKey).toBe(true);
+    expect(await readList(7)).toBe(true);
+    expect(keyNotes(notes)).toEqual([]);
+    expect(fs.existsSync(marker())).toBe(false);
+  });
+
+  test("session_start 发现被占用（keybinding / extension / reserved）：list = false，警告一次（含种类、不含值），留下标记；/pii list 照常可用", async () => {
+    for (const held of [{ kind: "keybinding", keybindings: ["x"] }, { kind: "extension", extensionPath: "/x" }, { kind: "reserved" }]) {
+      process.env.TERN_PANE = "7";
+      fresh();
+      fs.rmSync(marker(), { force: true });
+      const t = makePi();
+      t.conflicts.set(LIST_KEY, held);
+      piiGuard(t.pi);
+      const { ctx, notes, shown, answers } = makeCtx();
+      await t.emit("session_start", {}, ctx);
+      expect(testHooks.runtime().listKey).toBe(false);
+      expect(await readList(7)).toBe(false);
+      const w = keyNotes(notes);
+      expect(w.length).toBe(1);
+      expect(w[0]!.level).toBe("warning");
+      expect(w[0]!.msg).toContain(held.kind);
+      expect(w[0]!.msg).toContain("/pii list");
+      expect(fs.existsSync(marker())).toBe(true);
+      // 命令照常
+      await send(t, ctx, userText(`手机 ${V.zhPhone}`));
+      answers.push(() => undefined);
+      await t.list(ctx);
+      expect(shown.length).toBe(1);
+    }
+  });
+
+  test("有标记时下次启动不再注册（不抢占）；仍被占用时保持安静，list = false，标记还在", async () => {
+    process.env.TERN_PANE = "7";
+    fresh();
+    fs.writeFileSync(marker(), "x");
+    const t = makePi();
+    t.conflicts.set(LIST_KEY, { kind: "extension", extensionPath: "/other" });
+    piiGuard(t.pi);
+    expect(t.shortcuts.has(LIST_KEY)).toBe(false);
+    expect(t.commands.has("pii")).toBe(true);
+    const { ctx, notes } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    expect(keyNotes(notes)).toEqual([]);
+    expect(fs.existsSync(marker())).toBe(true);
+    expect(await readList(7)).toBe(false);
+  });
+
+  test("有标记但快捷键已空闲：本次仍不注册（list = false），删标记并提示重启后恢复；再下次启动注册、list = true", async () => {
+    process.env.TERN_PANE = "7";
+    fresh();
+    fs.writeFileSync(marker(), "x");
+    const t = makePi();
+    piiGuard(t.pi);
+    expect(t.shortcuts.has(LIST_KEY)).toBe(false);
+    const { ctx, notes } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    expect(fs.existsSync(marker())).toBe(false);
+    const n = keyNotes(notes);
+    expect(n.length).toBe(1);
+    expect(n[0]!.level).toBe("info");
+    expect(n[0]!.msg).toContain("重启");
+    expect(await readList(7)).toBe(false);
+    // 下次启动
+    testHooks.reset();
+    fresh();
+    const t2 = makePi();
+    piiGuard(t2.pi);
+    expect(t2.shortcuts.has(LIST_KEY)).toBe(true);
+    await t2.emit("session_start", {}, makeCtx().ctx);
+    expect(await readList(7)).toBe(true);
+  });
+
+  test("占用 → 标记 → 下次不注册 → 空闲 → 恢复：完整往返", async () => {
+    fresh();
+    const a = makePi();
+    a.conflicts.set(LIST_KEY, { kind: "extension", extensionPath: "/other" });
+    piiGuard(a.pi);
+    await a.emit("session_start", {}, makeCtx().ctx);
+    expect(fs.existsSync(marker())).toBe(true);
+    testHooks.reset();
+    fresh();
+    const b = makePi();
+    b.conflicts.set(LIST_KEY, { kind: "extension", extensionPath: "/other" });
+    piiGuard(b.pi);
+    expect(b.shortcuts.has(LIST_KEY)).toBe(false);
+    await b.emit("session_start", {}, makeCtx().ctx);
+    testHooks.reset();
+    fresh();
+    const c = makePi();
+    piiGuard(c.pi);
+    expect(c.shortcuts.has(LIST_KEY)).toBe(false);
+    await c.emit("session_start", {}, makeCtx().ctx);
+    expect(fs.existsSync(marker())).toBe(false);
+    testHooks.reset();
+    fresh();
+    const d = makePi();
+    piiGuard(d.pi);
+    expect(d.shortcuts.has(LIST_KEY)).toBe(true);
+  });
+
+  test("omp 没有 getShortcutConflict（旧版本）：无法确认，list = false，不写标记", async () => {
+    process.env.TERN_PANE = "7";
+    fresh();
+    const t = makePi();
+    (t.pi as any).getShortcutConflict = undefined;
+    piiGuard(t.pi);
+    expect(t.shortcuts.has(LIST_KEY)).toBe(true);
+    const { ctx, notes } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    expect(keyNotes(notes)).toEqual([]);
+    expect(await readList(7)).toBe(false);
+    expect(fs.existsSync(marker())).toBe(false);
+  });
+
+  test("getShortcutConflict 抛错（加载阶段的行为）：当作无法确认，不影响启动", async () => {
+    process.env.TERN_PANE = "7";
+    fresh();
+    const t = makePi();
+    (t.pi as any).getShortcutConflict = () => {
+      throw new Error("Extension runtime not initialized");
+    };
+    piiGuard(t.pi);
+    const { ctx } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    expect(await readList(7)).toBe(false);
+  });
+
+  test("无界面、子代理、非 tui 模式：不检查快捷键、不写标记、不提示", async () => {
+    for (const over of [{ hasUI: false }, { agent: { kind: "sub" } }, { mode: "rpc" }]) {
+      fresh();
+      fs.rmSync(marker(), { force: true });
+      const t = makePi();
+      t.conflicts.set(LIST_KEY, { kind: "reserved" });
+      piiGuard(t.pi);
+      const c = makeCtx(over);
+      await t.emit("session_start", {}, c.ctx);
+      expect(keyNotes(c.notes)).toEqual([]);
+      expect(fs.existsSync(marker())).toBe(false);
+      expect(testHooks.runtime().listKey).toBe(false);
+    }
+  });
+
+  test("标记文件写不进去（数据目录是个文件）：只记 debug，不抛错、不影响启动", async () => {
+    fresh();
+    const blocked = path.join(dir, "blocked");
+    fs.writeFileSync(blocked, "x");
+    const rt = testHooks.runtime();
+    rt.paths = { ...rt.paths, root: blocked };
+    const t = makePi();
+    t.conflicts.set(LIST_KEY, { kind: "reserved" });
+    piiGuard(t.pi);
+    const { ctx } = makeCtx();
+    await t.emit("session_start", {}, ctx);
+    expect(t.debug.some((d) => d.includes("标记"))).toBe(true);
+    expect(rt.listKey).toBe(false);
   });
 });
