@@ -1,6 +1,8 @@
 --!strict
--- omp-pii-guard 的 Tern 底栏插件：在运行着 omp（已加载 omp-pii-guard 扩展）的窗格的底栏显示一个可点击的 PII 段，
--- 点击（或命令面板“PII Guard：显示遮挡情况”）弹出 /pii 的内容。
+-- omp-pii-guard 的 Tern 底栏插件：在运行着 omp（已加载 omp-pii-guard 扩展）的窗格的底栏显示一个可点击的 PII 段。
+-- 点击底栏段（或命令面板“PII Guard：查看遮挡的值”）：向这个窗格的 omp 发快捷键（只发按键，不发文字），
+-- 由 omp 自己在界面里弹出“本会话遮挡的值”列表（完整原值只出现在那个界面里；本插件不读、不写、不经手原值）。
+-- 命令面板“PII Guard：显示遮挡情况”：toast 显示 /pii 的内容（只有计数）。
 --
 -- 数据来源：扩展写的状态文件 <数据目录>/tern/<TERN_PANE>.json（格式见仓库 README 与 src/tern.ts，只含计数与状态）。
 -- <数据目录> 的取值：插件 kv 里的 state_dir（<Tern 数据目录>/plugin-data/pii-guard/kv.json 的 "state_dir"，
@@ -30,6 +32,9 @@ type State = {
 
 local POLL_MS = 2000
 local KINDS = { "PERSON", "ADDRESS", "PHONE", "EMAIL", "ACCOUNT", "SECRET" }
+-- 扩展的 LIST_KEY（src/index.ts，ctrl+alt+p）的终端编码：CSI u（kitty 键盘协议），keycode 112 = p，修饰位 7 = 1 + ctrl(4) + alt(2)。
+-- cx:run 把它当终端输入写进窗格；omp 把它识别成快捷键并拦下，输入框里的草稿不受影响。两处要一起改。
+local LIST_KEY_SEQ = "\27[112;7u"
 
 -- pane -> 最近一次读到、且 pid 存活的状态；没有或已失效的为 nil
 local cache: { [number]: State } = {}
@@ -127,11 +132,11 @@ local function segment(s: State): { text: string, icon: string, tone: string?, c
 	local n = total(s)
 	local bad = s.model.state == "unavailable" or s.failed > 0 or s.level == "warning"
 	if not s.on then
-		return { text = "PII 关", icon = "shield", tone = "muted", command = "plugin.pii-guard.details" }
+		return { text = "PII 关", icon = "shield", tone = "muted", command = "plugin.pii-guard.list" }
 	elseif bad then
-		return { text = "PII " .. n, icon = "shield-alert", tone = "error", command = "plugin.pii-guard.details" }
+		return { text = "PII " .. n, icon = "shield-alert", tone = "error", command = "plugin.pii-guard.list" }
 	end
-	return { text = "PII " .. n, icon = "shield", tone = if n > 0 then "accent" else nil, command = "plugin.pii-guard.details" }
+	return { text = "PII " .. n, icon = "shield", tone = if n > 0 then "accent" else nil, command = "plugin.pii-guard.list" }
 end
 
 -- 底栏要不要重画的依据：窗格身份 + 有没有状态 + 段的内容。formatter 的结果按输入（窗格）缓存，
@@ -263,5 +268,27 @@ local function details(cx: WindowCx)
 end
 
 tern.command({ id = "details", title = "PII Guard：显示遮挡情况", icon = "shield", run = details })
+
+-- 向焦点窗格的 omp 发快捷键，让它弹出遮挡值列表。发之前：状态文件有效（pid 存活、窗格相符），窗格还在、仍是焦点窗格。
+-- 没有这样的窗格（没在跑带 PII 保护的 omp）就只提示，不向任何窗格发输入。
+local function openList(cx: WindowCx)
+	local pane = cx.session:focused()
+	if not pane then
+		cx:toast("info", "没有焦点窗格")
+		return
+	end
+	load(cx, pane, function(s, cx2)
+		local c = cx2
+		if not c then return end
+		if not s then
+			c:toast("info", "这个窗格没有运行带 PII 保护的 omp", "需要在窗格里启动加载了 omp-pii-guard 扩展的 omp；只有 Tern 里的 omp 会写状态文件。")
+			return
+		end
+		if c.session:focused() ~= pane or c.session:pane(pane) == nil then return end
+		c:run(pane, LIST_KEY_SEQ)
+	end)
+end
+
+tern.command({ id = "list", title = "PII Guard：查看遮挡的值", icon = "shield", run = openList })
 
 schedule()

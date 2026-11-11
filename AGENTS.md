@@ -27,7 +27,7 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/index.ts` | 扩展入口：`/pii` 命令（状态、`setup`、`on`/`off`）；挂接事件（`session_start`/`switch`/`branch`/`tree`/`compact`、`before_provider_request`、`tool_call`、`assistant_message`、`input`、`tool_result`）和助手文本渲染器；进程级单例 `Runtime`（`globalThis[Symbol.for("omp-pii-guard.runtime")]`）；`testHooks` 供测试重置 |
+| `src/index.ts` | 扩展入口：`/pii` 命令（状态、`list`、`setup`、`on`/`off`）与快捷键 `LIST_KEY`（`ctrl+alt+p`，同样打开原值列表）；挂接事件（`session_start`/`switch`/`branch`/`tree`/`compact`、`before_provider_request`、`tool_call`、`assistant_message`、`input`、`tool_result`）和助手文本渲染器；进程级单例 `Runtime`（`globalThis[Symbol.for("omp-pii-guard.runtime")]`）；`testHooks` 供测试重置 |
 | `src/config.ts` | 路径（`PII_GUARD_DIR`、`PII_GUARD_MODEL_DIR`）、环境开关（`OMP_PII_GUARD`、`PII_GUARD_NO_RESTORE`）、`config.json` 解析与校验（字段非法回落默认并记 `warnings`） |
 | `src/guard.ts` | AstrLink Guard 推理（510 token 窗口、重叠 128、分数下限 0.5）、`MODEL_FILES`（文件名/大小/sha256）与 `verifyModel`、并发闸门 `Limiter`、`Recognizer` 接口（测试换假识别器） |
 | `src/setup.ts` | `/pii setup`：已就绪跳过 → 复制本机 magpie 缓存 → 从固定修订下载；临时文件 + 校验 + 原子替换。**扩展里唯一会联网的代码** |
@@ -41,8 +41,8 @@
 | `src/filters.ts`、`zhname.ts`、`email.ts`、`packages.ts`、`ids.ts`、`thingname.ts`、`text.ts` | 误报过滤与中文名补找，移植自 magpie（见 `NOTICE`） |
 | `src/zhdata.ts`、`src/tlds.ts` | 机械生成的数据表（中文姓氏/词表、ICANN 顶级域），文件头注明来源；不要手工增删条目 |
 | `src/types.ts` | `Kind`、`RawFind`、`Span`、`ModelOptions` |
-| `test/*.test.ts` | `bun:test` 用例，每个 `src` 模块对应一个或多个文件（`index`、`transport`、`mask`、`payload`、`placeholder`、`setup`、`filters`、`known`、`zhname`、`email`、`offsets`、`local`、`perf`、`guard`、`tern`）；`helpers.ts`（把 magpie 测试里的 fakeModel 换成 AstrLink 标签）、`fake.ts`（`FakeRecognizer`）是辅助 |
-| `tern-plugin/` | 可选的 Tern 底栏插件（`plugin.toml` + `window.luau`，Luau）：读扩展写的状态文件，在焦点窗格的底栏显示可点击的 PII 段（点击 → toast，同名命令 `plugin.pii-guard.details`）。不属于 omp 扩展，不随 `scripts/install.sh` 安装；安装 `tern plugin install <本仓库目录>/tern-plugin --force`。没有自动化测试，改动要在 Tern 里实测（见第 6 节）。formatter 只读缓存、不做 I/O（Tern 限制 4 ms） |
+| `test/*.test.ts` | `bun:test` 用例，每个 `src` 模块对应一个或多个文件（`index`、`list`、`transport`、`mask`、`payload`、`placeholder`、`setup`、`filters`、`known`、`zhname`、`email`、`offsets`、`local`、`perf`、`guard`、`tern`；`list` 覆盖 `/pii list` 与快捷键）；`helpers.ts`（把 magpie 测试里的 fakeModel 换成 AstrLink 标签）、`fake.ts`（`FakeRecognizer`）是辅助 |
+| `tern-plugin/` | 可选的 Tern 底栏插件（`plugin.toml` + `window.luau`，Luau）：读扩展写的状态文件，在焦点窗格的底栏显示可点击的 PII 段（点击 → 向 omp 窗格发快捷键打开原值列表，命令 `plugin.pii-guard.list`；命令 `plugin.pii-guard.details` 仍是弹统计 toast）。不属于 omp 扩展，不随 `scripts/install.sh` 安装；安装 `tern plugin install <本仓库目录>/tern-plugin --force`。没有自动化测试，改动要在 Tern 里实测（见第 6 节）。formatter 只读缓存、不做 I/O（Tern 限制 4 ms） |
 | `scripts/install.sh` | 克隆后复制安装：校验并复制模型、复制 `src/` 到 omp 的扩展目录并 `npm ci`；模型只从本机缓存复制、不下载，`npm ci` 在依赖未缓存时会联网；不改 omp 配置 |
 | `scripts/bench.ts`、`scripts/bench-corpus.ts` | 基准与固定种子的合成语料生成器；README“性能”一节的数字来自它 |
 | `docs/demo/` | README 的演示动图（`demo.*.gif`）、vhs 脚本（`demo.*.tape`）、本地模拟服务端 `mock-server.ts`、重录脚本 `record.sh` |
@@ -78,7 +78,7 @@
 1. **fail-closed：处理失败的请求一律不发出，不放行原文。** 出口（`before_provider_request`）失败时 `return {}`；网络层对“已知 LLM 服务的推理端点上无法遮挡的体”（无法解码、无法解析、认不出格式、不支持的编码、遮挡出错）不发出。不得为了“让请求通过”加 try/catch 后原样放行。例外只有设计内的两种：出口超时且网络层在位时交给网络层；未知来源上认不出格式的非 LLM 形状体原样放行（见 `src/transport.ts` 文件头）。
 2. **不发出的方式必须是合成的不可重试响应，不能是连接错误。** omp 18.18.1 把连接类错误当成可重试，会重试约 10 次、`-p` 150 s 以上不退出。所以：fetch 返回合成 HTTP 422（头 `x-should-retry: false`、JSON 错误体 `code: pii_guard_blocked`）；WebSocket 先投递一帧服务端 `error` 事件（同 code）再以 1000 关闭；`ClientRequest` 产出合成的 422 `IncomingMessage`，不 `destroy` 成连接错误。错误文本是固定的 ASCII 句子（`BLOCKED_MESSAGE`），不含 timeout/connection/server error 之类会被当成瞬时错误的词；具体原因只走界面提示（`deps.fail`）。相关用例：`test/transport.test.ts`“不发出时的失败方式”、`test/index.test.ts`。
 3. **超时预算**：出口内部截止 `BPR_BUDGET_MS = 25_000`（omp 的处理器 30 s 超时后会发出原文）；网络层 `NET_BUDGET_MS = 180_000`。两者不得随意加大或去掉。
-4. **不记录、不外泄原值。** 通知、`console.error`、`logger.debug`、错误文本只写原因与路径，不写识别到的值或请求内容；不新建全局明文映射文件。占位符映射只在内存里，并经 `pi.appendEntry("pii-guard.map", …)` 写入当前会话（会话文件本身已含原文）。
+4. **不记录、不外泄原值。** 通知、`console.error`、`logger.debug`、错误文本只写原因与路径，不写识别到的值或请求内容；不新建全局明文映射文件。**唯一例外**：`/pii list` 与快捷键（`showList`）在本机 omp 界面（`ctx.ui.select`）里显示本会话遮挡的原值——只进这个弹层，不进通知、日志、对话（`sendMessage`/`sendUserMessage`/`appendEntry`）、状态文件或任何文件，无界面（`ctx.hasUI` 为假）和子代理里不显示；值里的控制字符一律换成可见图形，防止终端转义序列生效；列表与 `/pii` 计数同源（`used`）。占位符映射只在内存里，并经 `pi.appendEntry("pii-guard.map", …)` 写入当前会话（会话文件本身已含原文）。
 5. **占位符格式与 HMAC 密钥**：`{{KIND_xxxxxxxx}}`，`xxxxxxxx` = base32 小写 `HMAC-SHA256(key, kind + "\0" + value)` 的前 8 位（碰撞时加长，最长 32），同值同占位符，以保证提示缓存稳定。密钥文件 `<数据目录>/key` 为 32 字节随机数、权限 0600，首次运行时生成，**不进任何请求、不写日志**；长度不对时抛错而不是覆盖；读到时权限不是 0600 一律改回。改占位符外形要同时改 `src/placeholder.ts` 的 `PH_RE` 和 `src/mask.ts` 的 `PROTECTED`，并接受“新旧请求里同一值占位符不同”的缓存代价。
 6. **运行时不联网。** 只有 `/pii setup`（`src/setup.ts`）会联网；识别、遮挡、还原全部本地完成。不得在其他路径加遥测、下载、更新检查。
 7. **模型固定修订与校验。** 模型文件名、大小、sha256 钉死在 `src/guard.ts` 的 `MODEL_FILES`，`scripts/install.sh` 的 `REV`/`FILES` 保留同值，`test/setup.test.ts` 断言两者一致；加载与 `/pii setup`、`install.sh` 都要校验 sha256，校验失败不替换已有的正确文件。升级模型必须同时改这几处并更新 README 与 `NOTICE` 里的版本说明。模型文件不进仓库。
@@ -89,7 +89,7 @@
 12. **偏移一律是 JS 字符串下标（UTF-16 码元）。** 从 magpie（Go 字节下标）移植的判断，按字节算长度的地方（如密钥最短 8、`MIN_KNOWN`、数字占比）仍用 `byteLen`（UTF-8 字节数），其余按码元。与 magpie 行为有差别的地方，在代码注释里写明“与 magpie 的差别”和原因（写法参照 `src/known.ts` 文件头）；用例要覆盖 emoji、代理对（`test/offsets.test.ts`）。
 13. **子代理与主会话同进程**：模型、缓存、占位符表、网络层包装用 `globalThis` 单例（`Symbol.for("omp-pii-guard.runtime")`、`Symbol.for("omp-pii-guard.transport")`），只装一次；新增全局状态要遵守同一做法，并保证测试里能重置（现有的进程单例由 `testHooks.reset()` 清掉）。
 
-14. **Tern 状态文件是对外契约（版本 1），只含计数与状态。** 文件内容（`TernBody`/`TernFile`，`src/tern.ts`）不得出现任何原值、占位符、会话内容、请求内容；`summary` 来自 `/pii` 的摘要（只有计数、开关和模型加载失败的原因），新增字段前先确认它不会带出这些东西。只有 `TERN_PANE` 是正整数时才写，且只有主会话的交互界面（`ctx.hasUI`、非子代理、`mode` 未给出或为 `tui`）才认领；写入失败一律吞掉（只记 debug），不能影响遮挡、不能让请求失败或放行；写前 lstat 校验状态目录（真实目录、非符号链接、属主是当前用户，权限收紧到 0700，做不到就放弃）；临时文件用随机名 + `wx` 排他创建、0600，再 rename；退出和会话关闭时只删“本实例写过且文件里 pid 是自己”的文件（没认领的进程如 `omp -p` 不得删别人的）。插件把文件当不可信输入，`validate()` 逐项校验后才进缓存，`kill -0` 只对校验过的 pid 调用；新增字段要同步校验。会话切换（`session_switch`/`branch`/`tree` 不会重跑工厂）时，本会话计数 `used` 由 `loadBranch` 按目标分支里的映射条目重建，`/pii` 与状态文件共用它。改字段含义或格式要提高 `TERN_STATE_VERSION`，同步 `tern-plugin/window.luau`（它只认 `v == 1`）、两份 README 和 `test/tern.test.ts`。插件侧只读这个文件，不得反过来向扩展写东西。
+14. **Tern 状态文件是对外契约（版本 1），只含计数与状态。** 文件内容（`TernBody`/`TernFile`，`src/tern.ts`）不得出现任何原值、占位符、会话内容、请求内容；`summary` 来自 `/pii` 的摘要（只有计数、开关和模型加载失败的原因），新增字段前先确认它不会带出这些东西。只有 `TERN_PANE` 是正整数时才写，且只有主会话的交互界面（`ctx.hasUI`、非子代理、`mode` 未给出或为 `tui`）才认领；写入失败一律吞掉（只记 debug），不能影响遮挡、不能让请求失败或放行；写前 lstat 校验状态目录（真实目录、非符号链接、属主是当前用户，权限收紧到 0700，做不到就放弃）；临时文件用随机名 + `wx` 排他创建、0600，再 rename；退出和会话关闭时只删“本实例写过且文件里 pid 是自己”的文件（没认领的进程如 `omp -p` 不得删别人的）。插件把文件当不可信输入，`validate()` 逐项校验后才进缓存，`kill -0` 只对校验过的 pid 调用；新增字段要同步校验。会话切换（`session_switch`/`branch`/`tree` 不会重跑工厂）时，本会话计数 `used` 由 `loadBranch` 按目标分支里的映射条目重建，`/pii` 与状态文件共用它。改字段含义或格式要提高 `TERN_STATE_VERSION`，同步 `tern-plugin/window.luau`（它只认 `v == 1`）、两份 README 和 `test/tern.test.ts`。插件侧只读这个文件，不得反过来向扩展写东西；唯一的反向动作是点击时向 omp 窗格发送快捷键序列（`window.luau` 的 `LIST_KEY_SEQ` = `ESC[112;7u`，必须与 `src/index.ts` 的 `LIST_KEY` 保持一致，改一处要同步另一处、两份 README 和 `test/list.test.ts`），发之前校验状态文件里的 pid 存活、窗格一致且是当前焦点窗格，序列不携带任何数据，插件也不读写任何原值。
 
 ## 6. 改动流程与验证
 

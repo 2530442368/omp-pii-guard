@@ -25,6 +25,7 @@ function makePi() {
     registerCommand(name: string, o: any) {
       commands.set(name, o);
     },
+    registerShortcut() {},
     registerAssistantTextRenderer() {},
     appendEntry(type: string, data: any) {
       entries.push({ type, data });

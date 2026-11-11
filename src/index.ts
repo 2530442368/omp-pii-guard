@@ -5,6 +5,8 @@
 //   - 映射经 pi.appendEntry 持久化，session_start/branch/tree/switch 时重建。
 // 子代理会话与主会话同进程，模型、缓存、占位符表、网络层包装用 globalThis 单例，只装一次。
 //   - 在 Tern 里运行（有 TERN_PANE）时，把主会话交互界面的状态写成 Tern 状态文件（src/tern.ts），供 tern-plugin/ 的底栏插件显示；内容只含计数与状态。
+//   - /pii list 与快捷键 LIST_KEY：在 omp 自己的界面里列出本会话被遮挡的完整原值（只显示，不进对话、不进模型上下文、不写文件）。
+//     Tern 插件的底栏点击只是向本窗格发这个快捷键，不读写原值。
 
 import * as os from "node:os";
 import * as path from "node:path";
@@ -25,6 +27,10 @@ export const BPR_BUDGET_MS = 25_000;
 export const NET_BUDGET_MS = 180_000;
 const MAP_ENTRY = "pii-guard.map";
 const VERIFIED_VERSION = /^18\.18\./;
+/** 打开原值列表的快捷键。Tern 插件（tern-plugin/window.luau 的 LIST_KEYS）发的是它的终端编码，两处要一起改。 */
+export const LIST_KEY = "ctrl+alt+p";
+/** 列表里一行最多显示的原值字符数（超出截断，选中后看全文）；再长的话占位符与分数会被弹层的宽度切掉。 */
+export const LIST_MAX_VALUE = 40;
 /** 已确认是 omp 占位符的 $$…$$ 的个数上限（超过淘汰最旧的）。 */
 const MAX_CONFIRMED = 20_000;
 
@@ -413,6 +419,11 @@ export default function piiGuard(pi: any): void {
     if (!isOn(rt)) return;
     if (full) {
       for (const w of rt.config.warnings) notify(rt, w, "warning");
+      // 快捷键被别的绑定占了就不会生效（Tern 底栏点击发的就是它）：提示一次，/pii list 照常可用
+      try {
+        const held = ctx.hasUI ? pi.getShortcutConflict?.(LIST_KEY) : undefined;
+        if (held) notify(rt, `快捷键 ${LIST_KEY} 已被占用（${held.kind}），打不开原值列表（Tern 底栏点击也一样）；请用 /pii list`, "warning");
+      } catch {}
       // 预热模型：加载失败尽早提示
       ctx.setTimeout(async () => {
         try {
@@ -433,10 +444,47 @@ export default function piiGuard(pi: any): void {
   };
 
   // ---- /pii ----
+  // 原值只显示在本机 omp 界面（ctx.ui.select 弹层）：不写通知、不 sendMessage、不写日志与文件。
+  let listOpen = false;
+  const showList = async (ctx: any): Promise<void> => {
+    if (ctx.agent?.kind === "sub") return;
+    if (!ctx.hasUI) {
+      // 无界面模式（-p 等）的 ctx.ui.notify 不会显示：走 stderr；只有这句固定提示，不含任何值
+      console.error("[pii-guard] /pii list 需要交互界面（原值只在本机 omp 界面显示）");
+      return;
+    }
+    if (listOpen) return;
+    const items = listValues(rt, used);
+    if (items.length === 0) {
+      ctx.ui.notify("本会话还没有遮挡任何值", "info");
+      return;
+    }
+    listOpen = true;
+    try {
+      const title = `本会话遮挡的值（${items.length} 个）· 选中看全文`;
+      for (;;) {
+        const labels = new Map(items.map((it) => [listLabel(it), it]));
+        const picked = await ctx.ui.select(title, [...labels.keys()]);
+        const it = picked === undefined ? undefined : labels.get(picked);
+        if (!it) return;
+        await ctx.ui.select(detailTitle(it), ["返回列表"]);
+      }
+    } catch (e) {
+      notify(rt, `打开原值列表失败：${String((e as Error)?.message ?? e)}`, "warning");
+    } finally {
+      listOpen = false;
+    }
+  };
+  pi.registerShortcut(LIST_KEY, { description: "PII Guard：查看本会话遮挡的值", handler: showList });
+
   pi.registerCommand("pii", {
-    description: "PII Guard 状态；/pii setup 准备模型；/pii on|off 开关",
+    description: "PII Guard 状态；/pii list 查看遮挡的值；/pii setup 准备模型；/pii on|off 开关",
     handler: async (args: string, ctx: any) => {
       const a = String(args ?? "").trim().toLowerCase();
+      if (a === "list") {
+        await showList(ctx);
+        return;
+      }
       if (a === "on" || a === "off") {
         if (envDisabled()) {
           ctx.ui.notify("已被环境变量 OMP_PII_GUARD=off 全局关闭；去掉它并重启 omp 才能开启", "warning");
@@ -465,7 +513,7 @@ export default function piiGuard(pi: any): void {
         return;
       }
       if (a !== "" && a !== "status") {
-        ctx.ui.notify("用法：/pii（状态）、/pii setup（准备模型）、/pii on、/pii off", "warning");
+        ctx.ui.notify("用法：/pii（状态）、/pii list（查看遮挡的值）、/pii setup（准备模型）、/pii on、/pii off", "warning");
         return;
       }
       const st = status(rt, used);
@@ -624,6 +672,43 @@ export function hidePartialPlaceholder(text: string): string {
 
 const KIND_ZH: Record<Kind, string> = { PERSON: "人名", ADDRESS: "地址", PHONE: "手机", EMAIL: "邮箱", ACCOUNT: "账号", SECRET: "密码" };
 const DEFAULT_THRESHOLD = 0.8;
+
+/** 列表里的一项：本会话遮挡过的一个值。 */
+interface ListedValue {
+  kind: Kind;
+  ph: string;
+  value: string;
+  score: number;
+}
+
+/** 本会话遮挡过的值：与 /pii 的计数同源（`used`：本会话出现过的占位符），原值与分数取自占位符表。按类别分组，组内按首次出现的顺序。 */
+function listValues(rt: Runtime, used: ReadonlyMap<Kind, ReadonlySet<string>>): ListedValue[] {
+  const out: ListedValue[] = [];
+  for (const kind of ALL_KINDS) {
+    for (const ph of used.get(kind) ?? []) {
+      const value = rt.ph.lookup(ph);
+      if (value !== undefined) out.push({ kind, ph, value, score: rt.ph.scoreOf(ph) });
+    }
+  }
+  return out;
+}
+
+/** 原值里的控制字符（含 ESC 序列的起头）换成可见的控制图片符，别让它在终端里被当成指令；`keepLines` 时保留换行与制表符。 */
+function visible(s: string, keepLines: boolean): string {
+  return s.replace(keepLines ? /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g : /[\u0000-\u001f\u007f-\u009f]/g, (c) => (c.charCodeAt(0) <= 0x20 ? String.fromCharCode(0x2400 + c.charCodeAt(0)) : "\u2426"));
+}
+
+/** 列表里的一行：类别 · 原值（过长截断）· 占位符 · 分数。占位符唯一，所以每行都不同。 */
+function listLabel(it: ListedValue): string {
+  const chars = [...it.value];
+  const v = visible(chars.length > LIST_MAX_VALUE ? `${chars.slice(0, LIST_MAX_VALUE).join("")}…` : it.value, false);
+  return `${KIND_ZH[it.kind]} · ${v} · ${it.ph} · ${it.score.toFixed(2)}`;
+}
+
+/** 选中一项后的完整原值（标题里：第一行是类别、占位符、分数，其后是原值全文）。 */
+function detailTitle(it: ListedValue): string {
+  return `${KIND_ZH[it.kind]} · ${it.ph} · 识别分数 ${it.score.toFixed(2)}\n${visible(it.value, true)}`;
+}
 
 /**
  * 已检查的请求数（不重复）。网络层在位时，所有真正发出或被拒发的推理请求都会过网络层：遮挡成功的计入 netRequests，

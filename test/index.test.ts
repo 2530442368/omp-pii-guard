@@ -14,6 +14,7 @@ function makePi() {
   const handlers = new Map<string, Handler[]>();
   const entries: { type: string; data: any }[] = [];
   const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+  const shortcuts = new Map<string, { description?: string; handler: (ctx: any) => Promise<void> | void }>();
   const renderers: ((r: { text: string; streaming: boolean }) => string | undefined)[] = [];
   const pi = {
     setLabel() {},
@@ -22,6 +23,9 @@ function makePi() {
     },
     registerCommand(name: string, o: any) {
       commands.set(name, o);
+    },
+    registerShortcut(key: string, o: any) {
+      shortcuts.set(key, o);
     },
     registerAssistantTextRenderer(fn: any) {
       renderers.push(fn);
@@ -36,7 +40,7 @@ function makePi() {
     for (const h of handlers.get(ev) ?? []) last = await h(event, ctx);
     return last;
   };
-  return { pi, handlers, entries, commands, renderers, emit };
+  return { pi, handlers, entries, commands, shortcuts, renderers, emit };
 }
 
 function makeCtx(over: Record<string, any> = {}) {
