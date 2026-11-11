@@ -4,8 +4,10 @@
 //   - tool_call / assistant_message / 助手文本渲染器：把占位符还原成原值。
 //   - 映射经 pi.appendEntry 持久化，session_start/branch/tree/switch 时重建。
 // 子代理会话与主会话同进程，模型、缓存、占位符表、网络层包装用 globalThis 单例，只装一次。
+//   - 在 Tern 里运行（有 TERN_PANE）时，把主会话交互界面的状态写成 Tern 状态文件（src/tern.ts），供 tern-plugin/ 的底栏插件显示；内容只含计数与状态。
 
 import * as os from "node:os";
+import * as path from "node:path";
 import { ALL_KINDS, envDisabled, envNoRestore, loadConfig, paths, type Config, type Paths } from "./config.ts";
 import { AstrGuard, Limiter } from "./guard.ts";
 import { LocalLiterals } from "./local.ts";
@@ -13,6 +15,7 @@ import { MaskTimeout, Masker } from "./mask.ts";
 import { detectFormat, formatForApi, maskPayload, type TextItem, type TextMasker } from "./payload.ts";
 import { PH_RE, Placeholders, loadKey, restorePolicy } from "./placeholder.ts";
 import { defaultCacheDir, setupModel } from "./setup.ts";
+import { TernWriter, ternPane, type TernBody } from "./tern.ts";
 import { addLlmOrigin, installTransport, transportProblems } from "./transport.ts";
 import type { Kind } from "./types.ts";
 
@@ -54,6 +57,8 @@ interface Runtime {
   notifier: ((msg: string, level: Level) => void) | undefined;
   lastNotice: Map<string, number>;
   versionChecked: boolean;
+  /** 在 Tern 里运行（有 TERN_PANE）时的状态文件写入器；否则 undefined。 */
+  tern: TernWriter | undefined;
   stats: { bprRequests: number; bprChanged: number; bprFailed: number; bprFallbackToNet: number; netRequests: number; netRefused: number; netChanged: number; failures: number };
 }
 
@@ -86,7 +91,10 @@ function runtime(): Runtime {
     stats: { bprRequests: 0, bprChanged: 0, bprFailed: 0, bprFallbackToNet: 0, netRequests: 0, netRefused: 0, netChanged: 0, failures: 0 },
     shellsPending: 0,
     setupP: undefined,
+    tern: undefined,
   };
+  const pane = ternPane();
+  if (pane !== undefined) rt.tern = new TernWriter(path.join(p.root, "tern"), pane);
   rt.masker = new Masker(() => recognizer(rt), ph, () => rt.config);
   rt.masker.configChanged(); // 阈值、类别、允许词先生效（映射恢复、补遮都按它过滤）
   G[RT] = rt;
@@ -97,6 +105,7 @@ function runtime(): Runtime {
 export const testHooks = {
   runtime,
   reset(): void {
+    G[RT]?.tern?.dispose();
     G[RT] = undefined;
   },
 };
@@ -114,12 +123,14 @@ function recognizer(rt: Runtime): Promise<AstrGuard> {
     (g) => {
       rt.guard = g;
       rt.guardErr = undefined;
+      rt.tern?.touch();
       return g;
     },
     (e: unknown) => {
       rt.guardP = undefined; // 下次请求重试（用户可能刚装好模型）
       rt.guard = undefined;
       rt.guardErr = `模型加载失败：${String((e as Error)?.message ?? e)}`;
+      rt.tern?.touch();
       throw new Error(rt.guardErr);
     },
   );
@@ -132,6 +143,7 @@ const OFF_HINT = "临时关闭：/pii off，或设置环境变量 OMP_PII_GUARD=
 async function runSetup(rt: Runtime): Promise<void> {
   const start = Date.now();
   try {
+    rt.tern?.touch();
     const r = await setupModel({ dir: rt.paths.modelDir, cacheDir: defaultCacheDir() });
     if (!rt.guard) {
       rt.guardErr = undefined;
@@ -163,6 +175,7 @@ function notify(rt: Runtime, msg: string, level: Level): void {
 
 function fail(rt: Runtime, where: string, err: unknown): void {
   rt.stats.failures++;
+  rt.tern?.touch();
   const reason = String((err as Error)?.message ?? err);
   notify(rt, `${where}遮挡失败，请求未发出：${reason}。${OFF_HINT}`, "error");
 }
@@ -220,6 +233,18 @@ export default function piiGuard(pi: any): void {
   const queue: TextItem[] = [];
   let scanning = false;
   const local = new LocalLiterals();
+  if (rt.tern) rt.tern.debug = (m) => pi.logger?.debug?.(m);
+
+  /** Tern 状态文件：只有主会话的交互界面（有 UI、非子代理、TUI）才认领；后认领的会话为准。 */
+  const ternOwner = {};
+  const ternClaim = (ctx: any): void => {
+    if (!rt.tern || !ctx?.hasUI || ctx.agent?.kind === "sub" || (ctx.mode !== undefined && ctx.mode !== "tui")) return;
+    rt.tern.claim(ternOwner, () => status(rt, used).tern);
+  };
+  pi.on("session_shutdown", async () => {
+    rt.tern?.release(ternOwner);
+    return undefined;
+  });
 
   /**
    * 出口：严格格式的 $$…$$ 在本地会话/系统提示里字面出现过 → 不是 omp 的占位符，不保护；没出现过 → 是 omp 刚生成的，
@@ -271,6 +296,7 @@ export default function piiGuard(pi: any): void {
         if (value === undefined) continue; // 映射里没有：请求里字面写的、长得像占位符的串，不计
         const set = used.get(kind) ?? new Set<string>();
         used.set(kind, set.add(ph));
+        rt.tern?.touch();
         const s = rt.ph.scoreOf(ph);
         const had = persisted.get(ph);
         if (had === undefined || s > had) {
@@ -366,6 +392,7 @@ export default function piiGuard(pi: any): void {
 
   const sessionKickoff = (ctx: any, full: boolean): void => {
     bindNotifier(ctx);
+    ternClaim(ctx);
     learnOrigins(ctx);
     if (full) {
       // 重读 config.json（改了 allow/kinds/阈值，开一个新会话就生效）
@@ -406,6 +433,7 @@ export default function piiGuard(pi: any): void {
           return;
         }
         rt.userOff = a === "off";
+        rt.tern?.touch();
         ctx.ui.notify(rt.userOff ? "pii-guard 已关闭（本进程所有会话；请求原样发出，还原仍然有效）" : "pii-guard 已开启", rt.userOff ? "warning" : "info");
         return;
       }
@@ -422,6 +450,7 @@ export default function piiGuard(pi: any): void {
         ctx.ui.notify(`开始准备模型（约 37 MB，目标 ${rt.paths.modelDir}）：已有的跳过，其次复制本机缓存，否则从 Hugging Face 下载并校验。完成后会有通知`, "info");
         rt.setupP = runSetup(rt).finally(() => {
           rt.setupP = undefined;
+          rt.tern?.touch();
         });
         return;
       }
@@ -437,6 +466,7 @@ export default function piiGuard(pi: any): void {
   if (envDisabled()) {
     pi.on("session_start", async (_e: unknown, ctx: any) => {
       bindNotifier(ctx);
+      ternClaim(ctx);
       notify(rt, "pii-guard 已被 OMP_PII_GUARD=off 全局关闭，不遮挡任何请求", "warning");
     });
     return;
@@ -451,6 +481,7 @@ export default function piiGuard(pi: any): void {
       const n = await maskPayload(format, body, { maskTexts: (items) => rt.masker.maskTexts(items, { deadline, isDollar: (ph) => rt.confirmed.has(ph) }) });
       rt.stats.netRequests++; // 只计遮挡成功的；失败与拒发的由 fail 回调计入 netRefused，每个请求恰好计一次
       if (n > 0) rt.stats.netChanged++;
+      rt.tern?.touch();
       return n;
     },
     fail: (where, err) => {
@@ -488,6 +519,7 @@ export default function piiGuard(pi: any): void {
     bindNotifier(ctx);
     learnOrigins(ctx);
     rt.stats.bprRequests++;
+    rt.tern?.touch();
     const api: string | undefined = ctx.model?.api;
     try {
       const format = formatForApi(api);
@@ -598,21 +630,35 @@ export function checkedRequests(s: Runtime["stats"]): number {
   return Math.max(s.netRequests + s.netRefused + s.bprFailed, s.bprRequests);
 }
 
-/** /pii 的状态：一行、" · " 分隔（部分客户端的通知气泡不保留换行），只说用户关心的。 */
-function status(rt: Runtime, used: ReadonlyMap<Kind, ReadonlySet<string>>): { text: string; level: Level } {
-  if (envDisabled()) return { text: "PII 保护已关闭（OMP_PII_GUARD=off，去掉环境变量并重启 omp 才能开启）· 请求将原样发出", level: "info" };
-  if (rt.userOff) return { text: `PII 保护已关闭（/pii off）· 请求将原样发出${rt.noRestore ? " · 还原已关闭（PII_GUARD_NO_RESTORE，测试用）" : "，回复中的占位符仍会还原"}`, level: "info" };
+/** /pii 的状态：一行、" · " 分隔（部分客户端的通知气泡不保留换行），只说用户关心的。`tern` 是同一份状态的结构化形式（Tern 状态文件）。 */
+function status(rt: Runtime, used: ReadonlyMap<Kind, ReadonlySet<string>>): { text: string; level: Level; tern: TernBody } {
+  const kinds = Object.fromEntries(ALL_KINDS.map((k) => [k, used.get(k)?.size ?? 0])) as Record<Kind, number>; // fromEntries 丢了键类型；键恰为 ALL_KINDS
+  const requests = checkedRequests(rt.stats);
+  const model: TernBody["model"] = rt.guard
+    ? { state: "ready" }
+    : rt.setupP
+      ? { state: "setup" }
+      : rt.guardErr
+        ? { state: "unavailable", reason: rt.guardErr.includes("模型文件不可用") ? "files" : "other" }
+        : { state: rt.guardP ? "loading" : "idle" };
+  const tern = (on: boolean, off: TernBody["off"], text: string, level: Level): { text: string; level: Level; tern: TernBody } => ({
+    text,
+    level,
+    tern: { on, ...(off ? { off } : {}), model, kinds, requests, failed: rt.stats.failures, level, summary: text },
+  });
+  if (envDisabled()) return tern(false, "env", "PII 保护已关闭（OMP_PII_GUARD=off，去掉环境变量并重启 omp 才能开启）· 请求将原样发出", "info");
+  if (rt.userOff) return tern(false, "user", `PII 保护已关闭（/pii off）· 请求将原样发出${rt.noRestore ? " · 还原已关闭（PII_GUARD_NO_RESTORE，测试用）" : "，回复中的占位符仍会还原"}`, "info");
   const parts = ["PII 保护已开启"];
   let warn = false;
-  if (rt.guard) parts.push("模型就绪");
-  else if (rt.setupP) parts.push("模型准备中（/pii setup）");
-  else if (rt.guardErr) {
+  if (model.state === "ready") parts.push("模型就绪");
+  else if (model.state === "setup") parts.push("模型准备中（/pii setup）");
+  else if (model.state === "unavailable") {
     warn = true;
-    parts.push(`⚠ 模型不可用：${rt.guardErr.replace(/^模型加载失败：/, "")}`);
-  } else parts.push(rt.guardP ? "模型加载中" : "模型将在首次请求时加载");
-  const counts = ALL_KINDS.filter((k) => used.get(k)?.size).map((k) => `${KIND_ZH[k]} ${used.get(k)!.size}`);
+    parts.push(`⚠ 模型不可用：${(rt.guardErr ?? "").replace(/^模型加载失败：/, "")}`);
+  } else parts.push(model.state === "loading" ? "模型加载中" : "模型将在首次请求时加载");
+  const counts = ALL_KINDS.filter((k) => kinds[k] > 0).map((k) => `${KIND_ZH[k]} ${kinds[k]}`);
   parts.push(counts.length > 0 ? `本会话已遮挡：${counts.join("、")}` : "本会话还没有需要遮挡的内容");
-  parts.push(`已检查 ${checkedRequests(rt.stats)} 个请求`);
+  parts.push(`已检查 ${requests} 个请求`);
   if (rt.stats.failures > 0) {
     warn = true;
     parts.push(`失败 ${rt.stats.failures} 次`);
@@ -625,5 +671,5 @@ function status(rt: Runtime, used: ReadonlyMap<Kind, ReadonlySet<string>>): { te
   if (rt.config.threshold !== DEFAULT_THRESHOLD) parts.push(`阈值 ${rt.config.threshold}`);
   if (rt.config.kinds.size < ALL_KINDS.length) parts.push(`只遮：${ALL_KINDS.filter((k) => rt.config.kinds.has(k)).map((k) => KIND_ZH[k]).join("、")}`);
   if (rt.noRestore) parts.push("还原已关闭（PII_GUARD_NO_RESTORE，测试用）");
-  return { text: parts.join(" · "), level: warn ? "warning" : "info" };
+  return tern(true, undefined, parts.join(" · "), warn ? "warning" : "info");
 }

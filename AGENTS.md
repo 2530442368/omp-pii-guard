@@ -31,6 +31,7 @@
 | `src/config.ts` | 路径（`PII_GUARD_DIR`、`PII_GUARD_MODEL_DIR`）、环境开关（`OMP_PII_GUARD`、`PII_GUARD_NO_RESTORE`）、`config.json` 解析与校验（字段非法回落默认并记 `warnings`） |
 | `src/guard.ts` | AstrLink Guard 推理（510 token 窗口、重叠 128、分数下限 0.5）、`MODEL_FILES`（文件名/大小/sha256）与 `verifyModel`、并发闸门 `Limiter`、`Recognizer` 接口（测试换假识别器） |
 | `src/setup.ts` | `/pii setup`：已就绪跳过 → 复制本机 magpie 缓存 → 从固定修订下载；临时文件 + 校验 + 原子替换。**扩展里唯一会联网的代码** |
+| `src/tern.ts` | Tern 状态文件：`TernWriter`（有 `TERN_PANE` 时把当前交互会话的状态写成 `<数据目录>/tern/<TERN_PANE>.json`：临时文件 + rename、0600、500 ms 去抖、退出/关闭时删除、顺手清 pid 已死的残留）、`TernBody`/`TernFile` 契约类型、`ternPane()`。内容由 `src/index.ts` 的 `status()` 产出（与 `/pii` 同一份数据） |
 | `src/mask.ts` | 遮挡管线：推理 → 过滤 → 已知值补遮 → 剪掉与已有占位符相交的部分 → 生成占位符；按文本 sha256 的 LRU 缓存；`$$…$$` / `{{…}}` 保护 |
 | `src/payload.ts` | 请求体遍历：按格式（`anthropic-messages`、`openai-responses`、`openai-codex-responses`、`openai-completions`）收集可改的字符串叶子并就地写回 |
 | `src/transport.ts` | 网络层兜底：包装 `globalThis.fetch`、`globalThis.WebSocket`、`http.ClientRequest.prototype.write/end`；已知 LLM origin 判定；不发出时合成 422 / WS error 帧 |
@@ -40,7 +41,8 @@
 | `src/filters.ts`、`zhname.ts`、`email.ts`、`packages.ts`、`ids.ts`、`thingname.ts`、`text.ts` | 误报过滤与中文名补找，移植自 magpie（见 `NOTICE`） |
 | `src/zhdata.ts`、`src/tlds.ts` | 机械生成的数据表（中文姓氏/词表、ICANN 顶级域），文件头注明来源；不要手工增删条目 |
 | `src/types.ts` | `Kind`、`RawFind`、`Span`、`ModelOptions` |
-| `test/*.test.ts` | `bun:test` 用例，每个 `src` 模块对应一个或多个文件（`index`、`transport`、`mask`、`payload`、`placeholder`、`setup`、`filters`、`known`、`zhname`、`email`、`offsets`、`local`、`perf`、`guard`）；`helpers.ts`（把 magpie 测试里的 fakeModel 换成 AstrLink 标签）、`fake.ts`（`FakeRecognizer`）是辅助 |
+| `test/*.test.ts` | `bun:test` 用例，每个 `src` 模块对应一个或多个文件（`index`、`transport`、`mask`、`payload`、`placeholder`、`setup`、`filters`、`known`、`zhname`、`email`、`offsets`、`local`、`perf`、`guard`、`tern`）；`helpers.ts`（把 magpie 测试里的 fakeModel 换成 AstrLink 标签）、`fake.ts`（`FakeRecognizer`）是辅助 |
+| `tern-plugin/` | 可选的 Tern 底栏插件（`plugin.toml` + `window.luau`，Luau）：读扩展写的状态文件，在焦点窗格的底栏显示可点击的 PII 段（点击 → toast，同名命令 `plugin.pii-guard.details`）。不属于 omp 扩展，不随 `scripts/install.sh` 安装；安装 `tern plugin install <本仓库目录>/tern-plugin --force`。没有自动化测试，改动要在 Tern 里实测（见第 6 节）。formatter 只读缓存、不做 I/O（Tern 限制 4 ms） |
 | `scripts/install.sh` | 克隆后复制安装：校验并复制模型、复制 `src/` 到 omp 的扩展目录并 `npm ci`；模型只从本机缓存复制、不下载，`npm ci` 在依赖未缓存时会联网；不改 omp 配置 |
 | `scripts/bench.ts`、`scripts/bench-corpus.ts` | 基准与固定种子的合成语料生成器；README“性能”一节的数字来自它 |
 | `docs/demo/` | README 的演示动图（`demo.*.gif`）、vhs 脚本（`demo.*.tape`）、本地模拟服务端 `mock-server.ts`、重录脚本 `record.sh` |
@@ -60,6 +62,7 @@
 | 开发时加载扩展 | `omp -e <本仓库目录>`（显式加载；**不要**把仓库代码直接放进 `~/.omp/agent/extensions`，那里会被所有新会话加载） |
 | 复制安装 | `scripts/install.sh`；会写入 omp 的 agent 目录（`OMP_AGENT_DIR`，默认 `~/.omp/agent`），仅在用户要求时运行，试跑时用 `OMP_AGENT_DIR`、`PII_GUARD_DIR` 指向临时目录 |
 | 在 omp 里准备模型 | 会话里执行 `/pii setup`（只有它会联网）；`/pii` 看状态；`/pii on`、`/pii off` 开关 |
+| 安装/更新 Tern 底栏插件 | `tern plugin install <本仓库目录>/tern-plugin --force`；`tern plugin list` 应显示 `pii-guard … ready`；卸载 `tern plugin remove pii-guard`。会改本机 Tern 的插件目录并让 Tern 重载插件，仅在用户要求或实测时执行 |
 | 重录演示动图 | `docs/demo/record.sh [zh\|en\|all]` |
 
 说明：
@@ -86,17 +89,20 @@
 12. **偏移一律是 JS 字符串下标（UTF-16 码元）。** 从 magpie（Go 字节下标）移植的判断，按字节算长度的地方（如密钥最短 8、`MIN_KNOWN`、数字占比）仍用 `byteLen`（UTF-8 字节数），其余按码元。与 magpie 行为有差别的地方，在代码注释里写明“与 magpie 的差别”和原因（写法参照 `src/known.ts` 文件头）；用例要覆盖 emoji、代理对（`test/offsets.test.ts`）。
 13. **子代理与主会话同进程**：模型、缓存、占位符表、网络层包装用 `globalThis` 单例（`Symbol.for("omp-pii-guard.runtime")`、`Symbol.for("omp-pii-guard.transport")`），只装一次；新增全局状态要遵守同一做法，并保证测试里能重置（现有的进程单例由 `testHooks.reset()` 清掉）。
 
+14. **Tern 状态文件是对外契约（版本 1），只含计数与状态。** 文件内容（`TernBody`/`TernFile`，`src/tern.ts`）不得出现任何原值、占位符、会话内容、请求内容；`summary` 来自 `/pii` 的摘要（只有计数、开关和模型加载失败的原因），新增字段前先确认它不会带出这些东西。只有 `TERN_PANE` 是正整数时才写，且只有主会话的交互界面（`ctx.hasUI`、非子代理、`mode` 未给出或为 `tui`）才认领；写入失败一律吞掉（只记 debug），不能影响遮挡、不能让请求失败或放行；权限 0600/目录 0700、临时文件 + rename；退出和会话关闭时删文件。改字段含义或格式要提高 `TERN_STATE_VERSION`，同步 `tern-plugin/window.luau`（它只认 `v == 1`）、两份 README 和 `test/tern.test.ts`。插件侧只读这个文件，不得反过来向扩展写东西。
+
 ## 6. 改动流程与验证
 
 1. 先读相关模块头部注释和对应测试，再动手。头部注释记录了设计取舍与 magpie 差异，是事实依据；注释与代码不一致时，同一次改动里修正。
 2. 行为改动必须配测试：管线/入口/网络层用 `FakeRecognizer`（`test/fake.ts`）与本机 http/WebSocket 服务器验证真实字节；过滤规则的用例沿用 `test/filters.test.ts` 的 `opts()`/`fakeFind()`。不得删改测试、放宽断言、吞异常来让测试通过。
 3. 测试隔离：用例用 `PII_GUARD_DIR` 指向临时目录（见 `test/index.test.ts` 的 `beforeEach`），不读写真实的 `~/.omp`；新增用例同样要还原 `process.env` 与全局补丁。
 4. 交付前跑全量 `bun test`（或 `BUN_BE_BUN=1 omp test`）并全部通过；只改文档时至少核对文中的命令、路径、配置键与代码一致。
-5. 改动影响识别结果、过滤规则、已知值补遮、线程/窗口、缓存或性能时，重跑 `bun run bench`，并把 README“性能”“找得准不准”里的数字、测试机器与日期一并更新。**README 里的数字必须来自实际运行，不得估算或沿用旧值。**
-6. `README.md` 与 `README.zh-CN.md` 同步修改：配置键、环境变量、命令、已验证环境、局限、数字两份必须一致。
-7. 配置键（`src/config.ts` 的 `known` 字段集合）、环境变量、`/pii` 子命令有增删时，同步 README“配置”“命令与开关”和 `scripts/install.sh` 的说明；用户可见文案保持中文。
-8. 新移植 magpie 代码或数据表：保持 MIT 声明，更新 `NOTICE`（上游提交、范围），文件头注明来源。
-9. 依赖升级（`onnxruntime-node`、`@anush008/tokenizers`）要在已验证的 omp 版本上用真模型跑全量测试和基准；锁文件随 `package.json` 一起提交。
+5. 改 `tern-plugin/` 必须在 Tern 里实测（它没有自动化测试，Luau 只在 Tern 窗口里运行）：`tern plugin install tern-plugin --force`，确认 `tern plugin list` 无报错；用临时 HOME、假 key 和 `docs/demo/mock-server.ts` 在一个 Tern 窗格里跑加载本扩展的 omp（不向真实模型服务发请求），确认底栏段出现且计数正确、点击出详情、其他窗格不显示、omp 退出后消失。实测别碰用户正在用的窗口：用 `TERN_CONFIG_DIR` + `TERN_DAEMON_SOCKET` 起独立的 Tern 实例，并用 `tern --control <sock>` 开窗口、`tern ctl --control <sock> shot/tree/click` 观察，用完关闭并清理临时目录。
+6. 改动影响识别结果、过滤规则、已知值补遮、线程/窗口、缓存或性能时，重跑 `bun run bench`，并把 README“性能”“找得准不准”里的数字、测试机器与日期一并更新。**README 里的数字必须来自实际运行，不得估算或沿用旧值。**
+7. `README.md` 与 `README.zh-CN.md` 同步修改：配置键、环境变量、命令、已验证环境、局限、数字两份必须一致。
+8. 配置键（`src/config.ts` 的 `known` 字段集合）、环境变量、`/pii` 子命令有增删时，同步 README“配置”“命令与开关”和 `scripts/install.sh` 的说明；用户可见文案保持中文。
+9. 新移植 magpie 代码或数据表：保持 MIT 声明，更新 `NOTICE`（上游提交、范围），文件头注明来源。
+10. 依赖升级（`onnxruntime-node`、`@anush008/tokenizers`）要在已验证的 omp 版本上用真模型跑全量测试和基准；锁文件随 `package.json` 一起提交。
 
 ## 7. 隐私与公开仓库规则
 

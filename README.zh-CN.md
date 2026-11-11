@@ -164,6 +164,23 @@ omp 的 Hide Secrets 在发出前把密钥换成 `$$…$$`；omp-pii-guard 不�
 
 启动自检：`session_start` 检查网络层包装仍在位；omp 版本不是已验证的 18.18.x 时提示“网络层遮挡未在此版本验证”（不阻断）；后台预热模型，加载失败立刻提示。
 
+### Tern 底栏插件（可选）
+
+在 [Tern](https://docs.stencil.so/tern/) 终端里跑 omp 时，可以在 Tern 的底栏（status line）显示一个可点击的 PII 小段，一眼看到保护是否开着、本会话已遮挡了多少个不同的值；点一下弹出和 `/pii` 一样的详情。插件在 `tern-plugin/`，纯 Luau，只读扩展写出的状态文件，不改 Tern 的其他行为。
+
+```sh
+tern plugin install <本仓库目录>/tern-plugin --force   # 安装（或更新）
+tern plugin list                                      # 应看到 pii-guard … ready
+tern plugin remove pii-guard                          # 卸载
+```
+
+- **底栏默认是关的**：Tern 的底栏要先打开——命令面板（⌘K）里执行 “Show status line”（动作 `status_bar`）。没开底栏时，也能从命令面板运行 “PII Guard：显示遮挡情况”（同样的详情）。
+- **显示什么**：只在当前焦点窗格里有一个带本扩展的 omp 时出现（其他窗格不显示，omp 退出后消失）。`PII 4` = 本会话已遮挡 4 个不同的值（各类别之和，与 `/pii` 同口径；还没遮挡时 `PII 0`）；`PII 关` = 保护已关闭（`/pii off` 或 `OMP_PII_GUARD=off`），灰色；模型不可用、有处理失败（请求被拦下）或网络层未就位时变红、图标改为盾牌加感叹号；正常时图标是盾牌，有遮挡内容时为强调色。点击弹出一条提示：第一段是开关与模型状态，其后是各类别计数与已检查的请求数（内容与 `/pii` 的摘要逐字相同，窄窗口里会折行）。
+- **原理**：omp 扩展在 Tern 里运行时（环境里有 `TERN_PANE`），把当前**交互**会话（有界面的主会话；子代理与无界面模式不写）的状态写到 `<数据目录>/tern/<TERN_PANE>.json`（默认 `~/.omp/agent/pii-guard/tern/`）：临时文件加 rename 原子写入，权限 0600（目录 0700），状态变化后约 0.5 秒内合并写一次；会话关闭、omp 退出时删除（被强杀留下的文件，插件按 pid 判断忽略，之后的 omp 写文件时会顺手清掉 pid 已不存在的残留）。不在 Tern 里（没有 `TERN_PANE`）时扩展什么都不写。插件每 2 秒看一次焦点窗格对应的文件，只在有文件时才解析它，并约每 6 秒执行一次 `kill -0` 确认 omp 进程还在；没有文件时每 2 秒只有一次 `fs.exists`，不起进程。底栏格式化函数只读缓存，不做 I/O。
+- **状态文件只含计数与状态，不含任何原值、占位符、会话内容**：`v`（格式版本，现为 1）、`pid`、`pane`、`on`/`off`（开关及关闭原因 `env`/`user`）、`model`（`state`：`ready`/`loading`/`setup`/`unavailable`/`idle`；不可用时 `reason`：`files`/`other`）、`kinds`（六个类别各自本会话已遮挡的不同值个数）、`requests`、`failed`、`level`（`info`/`warning`）、`summary`（与 `/pii` 相同的一行摘要，其中模型加载失败时含本机模型路径与错误原因，与 `/pii` 一致）、`updatedAt`。
+- **数据目录不是默认值时**：扩展用 `PII_GUARD_DIR` 改了数据目录，插件须读同一个目录：在 `<Tern 配置目录>/plugin-data/pii-guard/kv.json`（macOS：`~/Library/Application Support/Tern/plugin-data/pii-guard/kv.json`）里写 `{"state_dir": "<与 PII_GUARD_DIR 相同的目录>"}`（插件会在其下加 `/tern`），或让 Tern 进程的环境里带同名的 `PII_GUARD_DIR`；都没有就用 `~/.omp/agent/pii-guard`。
+- **限制**：只在 Tern 里有效；只显示当前焦点窗格；窗格里再套 `ssh`/`tmux` 运行的 omp 未验证；Tern 版本 0.9.14 上验证，Tern 插件接口升级可能需要同步；插件不提供从 Tern 端开关 PII 保护的入口（用 omp 里的 `/pii on|off`）。
+
 ## 性能
 
 下面的数字来自 `bun run bench` 在一台真实机器上的一次运行，不是估算。复现命令在本节末尾；你的硬件上数字会不同。
@@ -334,6 +351,8 @@ OMP_BIN=/path/to/omp PII_GUARD_MODEL_DIR=~/.cache/magpie/astrlink-guard/7216b6a3
 它用临时 HOME 与数据目录、假 API key 起一个真实的 omp（加载本扩展，不碰 `~/.omp`），连到 `docs/demo/mock-server.ts`：监听 127.0.0.1 的 Anthropic Messages 本地模拟，打印收到的最后一条用户消息，并按固定模板引用占位符回复。输入脚本在 `demo.zh-CN.tape` 与 `demo.en.tape`。
 
 含 T2 移植的 magpie 用例、假识别器驱动的管线/入口/网络层测试（本机 http 与 WebSocket 服务器验证真实字节）、真模型测试（模型目录默认 magpie 缓存，不存在则跳过）。测试里不对耗时做断言（耗时易抖）。
+
+`tern-plugin/`（Luau，在 Tern 窗口里运行）没有自动化测试；状态文件的写入方（`src/tern.ts`）由 `test/tern.test.ts` 覆盖。改插件要在 Tern 里实测：`tern plugin install tern-plugin --force`，在 Tern 窗格里跑加载本扩展的 omp（可连本地模拟服务端），确认底栏段、点击详情和 omp 退出后消失。
 
 ## 致谢
 

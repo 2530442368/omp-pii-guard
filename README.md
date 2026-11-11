@@ -164,6 +164,23 @@ Only placeholders that aren't found locally are protected; they are recorded in 
 
 Startup self-check: `session_start` checks that the network-layer wrappers are still in place; on an omp version other than the verified 18.18.x it warns "network-layer masking not verified on this version" (not blocking); it warms the model in the background and reports a load failure immediately.
 
+### Tern status-line plugin (optional)
+
+When you run omp inside [Tern](https://docs.stencil.so/tern/), a small clickable PII segment can sit in Tern's status line: it shows at a glance whether protection is on and how many distinct values this session has masked, and a click pops up the same details as `/pii`. The plugin lives in `tern-plugin/`, is plain Luau, only reads the state file the extension writes, and changes nothing else in Tern.
+
+```sh
+tern plugin install <repository directory>/tern-plugin --force   # install (or update)
+tern plugin list                                                # should show pii-guard … ready
+tern plugin remove pii-guard                                    # uninstall
+```
+
+- **The status line is off by default**: turn it on in Tern first — run "Show status line" (action `status_bar`) from the command palette (⌘K). With it off you can still run "PII Guard：显示遮挡情况" from the command palette (the same details).
+- **What it shows**: only while the focused pane runs an omp that has this extension (other panes show nothing; it disappears when omp exits). `PII 4` = 4 distinct values masked in this session (the sum over kinds, same count as `/pii`; `PII 0` before anything is masked); `PII 关` ("off") = protection is off (`/pii off` or `OMP_PII_GUARD=off`), gray; it turns red with an alert-shield icon when the model is unavailable, a request failed (was blocked) or the network layer is missing; otherwise a shield icon, in the accent colour once something has been masked. Clicking shows one notice: first the on/off and model state, then the per-kind counts and the number of requests checked (word for word the `/pii` summary; it wraps in a narrow window).
+- **How it works**: when the omp extension runs inside Tern (`TERN_PANE` is set) it writes the state of the current **interactive** session (the main session with a UI; subagents and no-UI modes don't write) to `<data directory>/tern/<TERN_PANE>.json` (default `~/.omp/agent/pii-guard/tern/`): atomic write via a temp file and rename, mode 0600 (directory 0700), one coalesced write within about 0.5 s of a change; it is deleted when the session closes or omp exits (a file left behind by a killed omp is ignored by the plugin via its pid, and the next omp that writes sweeps leftovers whose pid no longer exists). Outside Tern (no `TERN_PANE`) the extension writes nothing. Every 2 s the plugin looks at the file for the focused pane, parses it only if it exists, and runs `kill -0` about every 6 s to confirm the omp process is alive; with no file it does just one `fs.exists` per 2 s and starts no process. The status formatter only reads a cache and does no I/O.
+- **The state file holds only counts and status — no original value, placeholder or session content**: `v` (format version, currently 1), `pid`, `pane`, `on`/`off` (the switch and why it's off, `env`/`user`), `model` (`state`: `ready`/`loading`/`setup`/`unavailable`/`idle`; `reason` when unavailable: `files`/`other`), `kinds` (distinct values masked this session for each of the six kinds), `requests`, `failed`, `level` (`info`/`warning`), `summary` (the same one-line summary as `/pii`; when the model failed to load it contains the local model path and the error reason, as `/pii` does), `updatedAt`.
+- **A non-default data directory**: if you changed the extension's data directory with `PII_GUARD_DIR`, the plugin must read the same one: put `{"state_dir": "<the same directory as PII_GUARD_DIR>"}` in `<Tern config directory>/plugin-data/pii-guard/kv.json` (macOS: `~/Library/Application Support/Tern/plugin-data/pii-guard/kv.json`; the plugin appends `/tern`), or give the Tern process a `PII_GUARD_DIR` of its own; with neither it uses `~/.omp/agent/pii-guard`.
+- **Limits**: Tern only; only the focused pane is shown; an omp run inside `ssh`/`tmux` within a pane is unverified; verified on Tern 0.9.14, and a Tern plugin API change may need a matching update; the plugin has no control to switch PII protection from Tern (use `/pii on|off` in omp).
+
 ## Performance
 
 Numbers below come from `bun run bench`, one run on a real machine, not estimates. Reproduce them with the commands at the end of this section; numbers on your hardware will differ.
@@ -334,6 +351,8 @@ OMP_BIN=/path/to/omp PII_GUARD_MODEL_DIR=~/.cache/magpie/astrlink-guard/7216b6a3
 It runs a real omp (this extension, a temporary HOME and data directory, a fake API key; `~/.omp` is not touched) against `docs/demo/mock-server.ts`, a local mock of the Anthropic Messages API on 127.0.0.1 that prints the last user message it receives and replies from a fixed template quoting the placeholders. `demo.zh-CN.tape` and `demo.en.tape` hold the typing script.
 
 The tests include the magpie cases ported in T2, pipeline / entry / network-layer tests driven by a fake recognizer (a local http and WebSocket server checks the real bytes), and real-model tests (the model directory defaults to the magpie cache; they are skipped if it doesn't exist). The timing numbers are not asserted in tests, because timings are flaky.
+
+`tern-plugin/` (Luau, runs inside a Tern window) has no automated tests; the writer of the state file (`src/tern.ts`) is covered by `test/tern.test.ts`. After changing the plugin, check it in Tern: `tern plugin install tern-plugin --force`, run an omp with this extension in a Tern pane (it can talk to a local mock server), and confirm the status-line segment, the click details, and that it disappears when omp exits.
 
 ## Acknowledgements
 
