@@ -120,13 +120,27 @@ The cost: the model sees `{{PERSON_…}}`, not the name, so a task about the val
 | **`before_provider_request` (main path)** | Picks the format from `ctx.model.api`: `anthropic-messages`, `openai-responses`, `openai-codex-responses` or `openai-completions`. Any other api (including `devin-agent`) fails. It has an internal 25 s deadline (omp sends the original text after a handler's 30 s timeout). On timeout, if the network layer is in place and the request is recognisable, the request is handed to it (no 30 s limit there, capped at 180 s); otherwise the handler returns `{}` and the request is not sent |
 | **Network layer fallback** | Covers direct calls that skip bpr (title generation, local/remote compaction, judge…). Wraps `globalThis.fetch`, `globalThis.WebSocket` (queued per connection to keep order) and `http.ClientRequest.prototype.write/end` |
 | **Cache across layers** | Recognition results are cached by text sha256 (LRU; the key includes the args context and a config fingerprint), so one text is inferred once. A masked output that changed is cached under the same key, so the second layer doesn't infer again; a different context doesn't hit |
-| **Background prescan** | Uses `ctx.setTimeout`: `session_start` scans the whole branch, and `input` / `tool_result` / `assistant_message` / `tool_call` scan new content on arrival, so most egress hits the cache |
+| **Background prescan** | Uses `ctx.setTimeout`: `session_start` (and `switch` / `branch` / `tree`) scans only what the next request will actually contain: the summary of the **last compaction** plus the entries from its `firstKeptEntryId` onward (the whole branch when there is no compaction). `input` / `tool_result` / `assistant_message` / `tool_call` scan new content on arrival, so most egress hits the cache. Content from before a compaction is not prescanned; it is never sent, and if it ever is, egress masks it like anything else, just without a head start |
+| **Persistent cache, and one inference budget for all processes** | Raw model results are also kept on disk across restarts, and every omp process on the machine shares the same inference slots (next subsection) |
 
 **What the network layer touches.** Only requests to an LLM inference endpoint: the path (without the query string) ends in `/messages`, `/messages/count_tokens`, `/responses`, `/responses/compact`, `/chat/completions` or `/completions` (including codex's ws `…/responses`), **and** the origin is a known LLM service or the body is LLM-shaped. A known LLM service is decided by **origin** (scheme + host + effective port; `ws`/`wss` count as `http`/`https`; default ports 80/443). Sources: built-in `https://api.anthropic.com`, `https://api.openai.com`, `https://chatgpt.com`; the `baseUrl` of each provider in omp's model registry (`ctx.models.list()`, authenticated models); the `ctx.model.baseUrl` seen in bpr; and provider base-URL overrides in the environment (`*_BASE_URL`, such as `ANTHROPIC_BASE_URL`: omp sends requests there and `ctx.model.baseUrl` doesn't reflect it). Another port or scheme on the same host is another origin (a local gateway on 3425 is covered, an MCP service on 3000 is not).
 
 - **Inference endpoints of known services**: the body must be maskable. `Blob`, `ReadableStream` and `URLSearchParams` bodies are read in full and then processed; WebSocket binary frames are decoded as UTF-8 first. A body that can't be decoded, can't be parsed or isn't a recognised format is not sent. For WebSocket JSON frames, `type: "response.create"` goes through masking; any other frame must have a string `type`, and every string value must sit under `type`, `id`, `event_id`, `response_id`, `item_id` or `previous_response_id` to pass; otherwise it is not sent (this includes the bare `{}` omp sends after bpr fails).
 - **Inference paths on unknown origins**: a body that can't be recognised, can't be parsed or uses an unsupported encoding passes through untouched (plain JSON such as MCP SSE `/messages` on an unknown origin or a chat app's `/channels/1/messages` is not affected); an LLM-shaped body is masked as usual, and a masking failure still blocks it.
 - **Everything else** (oauth and models-list requests on the same host, JSON on a non-matching path) is byte-for-byte unchanged. `fetch` first builds the `Request` that actually takes effect (`new Request(input, init)` semantics), then reads headers, decodes and rewrites. `content-encoding` identity/gzip/deflate/br is supported; the rewrite is recompressed and `Content-Length` updated. An unsupported encoding such as zstd on a known service → not sent.
+
+### Restarts and many sessions at once
+
+Restoring a few dozen sessions at once (for example from a terminal manager) used to make every omp process load the model and rescan its whole history, which saturated every core. Three things bring that down; none of them changes what gets masked.
+
+| | |
+| :-- | :-- |
+| **Only prescan what is sent** | See *Background prescan* above: the prescan covers the last compaction's summary and what follows `firstKeptEntryId`. On a real set of 16 restored sessions that was 5.3 MB instead of 19.2 MB (72.6% less); sessions without a compaction are unchanged |
+| **Persistent recognition cache** | `<data dir>/cache/finds.sqlite` (`bun:sqlite`, WAL). One row per text: key = HMAC-SHA256 of the text with your key file and the model revision, value = the model's raw result (positions, labels, scores) and the day it was last used. **The text, the values and the placeholders are not stored.** A new process that meets a text it has seen before skips the model for it; the thresholds, filters, known-value pass and replacement still run on top, exactly as for a fresh result. A different model revision or key never hits. Rows are validated when read; an invalid row counts as a miss. At most 200 000 rows; beyond that the least recently used are dropped down to 90%. Writes are batched (200 rows or 3 s) and flushed at exit. A corrupt file is deleted and rebuilt once (it is derived data); if it still can't be opened the cache is switched off for that process |
+| **One inference budget for all processes** | `<data dir>/slots/` holds `total = max(1, floor(cores / threads))` slot files (3 on 14 cores with 4 threads). A window of inference holds one slot, so the machine runs at most `total` windows at once however many omp processes there are. The background prescan may use only the first `max(1, floor(floor(cores / 2) / threads))` slots (1 on 14 cores with 4 threads), so egress requests, which can use all of them and try the ones the prescan can't use first, are not stuck behind a prescan. A slot is a file created exclusively (mode 0600, content `pid token time`); waiting is polling with backoff and jitter; a slot whose pid is dead or that is older than 120 s is reclaimed; on exit a process releases its own. If the directory can't be used, the process limits itself in-process only and inference is never blocked on it |
+| **ORT thread spinning off** | `allow_spinning=0` for ORT's intra- and inter-op thread pools. Idle pool threads no longer burn CPU while waiting, which mattered most when many processes compete for the cores (measured below) |
+
+Measured on the batch-restore benchmark: [Performance](#performance). Limits of the cache and the slots: [Limitations](#limitations).
 
 ### Fail closed, and no retry storm
 
@@ -203,9 +217,25 @@ Measured on an Apple M3 Max (14 cores, 36 GB), macOS 26.3.1 (darwin 25.3.0), omp
 | **A new tool output** | 20.2 KB of fresh JSON tool output on top of the cached history: 1047 ms (1044 / 1048 / 1047 ms), mostly inference |
 | **Known-value pass** | 1 Mi characters × 1000 known values, 4187 hits: 25.9 ms with a fresh index (31.1 / 24.6 / 25.9 ms), 24.5 ms with the index cached |
 
-In short: most of the time is the model, roughly 25–50 ms per KB of new text at 4 threads, so a 20 KB tool result adds about a second to its first request, and anything already seen is free.
+These single-process rows were measured before the persistent cache and the cross-process slots were added; neither is involved in a single process's inference, and thread spinning makes no difference to one process running alone (see the restore section below). In short: most of the time is the model, roughly 25–50 ms per KB of new text at 4 threads, so a 20 KB tool result adds about a second to its first request, and anything already seen is free.
 
 The history for the prescan and egress rows is built from four content types in turn: Chinese prose, English prose, code from the dependency sources, and JSON tool output (synthetic, no personal data). The throughput figures use about 64 KB of each type, cut into documents of about 4 KB (code: whole files under 20 KB).
+
+### Restoring many sessions at once
+
+`bun run bench restore`: 8 fresh omp-like processes start at the same moment (as when a terminal manager restores a window of sessions), each loads the real model and prescans its **own** ~300 KB synthetic history (Chinese and English prose, JSON tool output and text with planted fake personal data; 765 texts sent to the model in all), 4 threads each, on the same 14-core machine, 2026-11-12. The processes are wired like the extension (in-process limiter + cross-process slots + persistent cache; the model starts loading at once). The baseline is the previous commit `bd45b51` (an in-process limiter per process, no persistent cache, no cross-process slots, thread spinning on), driven by the same script through `PII_BENCH_SRC`. The machine was shared with other work: load average 3.8 at the start of the new-code run and 4.2 at the start of the baseline run; "peak busy cores" is measured over the whole machine (so about 4 of the new run's 8.8 are other processes), "CPU time" counts only the benchmark's processes.
+
+| | Wall clock | CPU time, sum over the 8 processes | Peak busy cores (whole machine) | Peak load avg (1 min) | Texts sent to the model |
+| --- | --- | --- | --- | --- | --- |
+| Before (`bd45b51`), every start | 66.8 s | 823.5 s | 14.0 (all cores) | 28.2 | 765 |
+| Now, first start, cache empty | 88.4 s | 330.7 s (−60%) | 8.8 | 5.1 | 765 |
+| Now, second start, same histories | 0.2 s | 1.3 s | n/a (shorter than the 1 s sampling) | 4.7 (no change) | 0 |
+
+Reading it: with an empty cache the cross-process budget (1 background slot on this machine) trades some wall clock (+32%) for a much lighter machine: 60% less CPU time and a load average that stays near where it was instead of going to 28, so everything else on the machine keeps running. With a warm cache the same restore costs about 0.16 s of CPU per process (loading the model, which still happens at session start, plus the cache lookups), with no text sent to the model at all. Sampling the slot directory every 50 ms never showed more than 1 slot file held at a time in the new runs (the background limit). Peak load average is a 1-minute average and lags; the baseline's 28 was still rising when it ended.
+
+A separate check on the **thread spinning** alone (6 processes × 100 KB, 4 threads each, no cross-process slots and no cache in either variant, so 72 inference threads on 14 cores; the same `bd45b51` code with and without `allow_spinning=0`, two runs each): CPU time 197.9 / 196.0 s → 103.8 / 104.1 s (−47%), wall clock 15.2 / 15.4 s → 10.1 / 8.8 s. A single process alone is not affected (one window, 4 threads: no difference measured).
+
+The history in this benchmark is synthetic and made of short texts, so the numbers show the mechanism, not your sessions. A real restore of 21 sessions of different sizes will differ; `PII_BENCH_RESTORE_PROCS=21` runs that many.
 
 ### Threads
 
@@ -270,7 +300,10 @@ npm ci --ignore-scripts      # or the extension's own install; the dependency co
 bun run bench                # everything, 4 threads (about 2 minutes)
 bun run bench sweep          # thread sweep: 1, 2, 4, 8 threads, a fresh process each (about 10 minutes)
 bun run bench speed          # or: effect
+bun run bench restore        # many sessions at once: cold then warm cache (about 2 minutes with the defaults)
 ```
+
+For the baseline of `bench restore`: `git worktree add /tmp/pii-baseline bd45b51`, copy or link `node_modules` into it, then `PII_BENCH_SRC=/tmp/pii-baseline/src PII_BENCH_RESTORE_ROUNDS=1 bun run bench restore` (a source directory without `cache.ts` / `slots.ts` is wired the old way). Knobs: `PII_BENCH_RESTORE_PROCS` (default 8), `PII_BENCH_RESTORE_KB` (default 300), `PII_BENCH_RESTORE_ROUNDS` (default 2). Note `uptime` before and after: the numbers are only comparable at a similar machine load.
 
 The model directory is taken from `PII_GUARD_MODEL_DIR`, else `<data dir>/model`, else the magpie cache; run `/pii setup` first. Other knobs: `THREADS`, `PII_BENCH_JSON=out.json` (writes the results as JSON), `PII_BENCH_SEED`, `PII_BENCH_PER_KIND`, `PII_BENCH_REPS`. The default run reads only the synthetic generator (`scripts/bench-corpus.ts`), `node_modules` and `src/`. To add your own code or omp sessions, set `PII_BENCH_DIRS` / `PII_BENCH_SESSIONS`; those are reported as counts and shapes only, never as values.
 
@@ -299,6 +332,8 @@ Optional file `~/.omp/agent/pii-guard/config.json`, read at `session_start`; an 
 | **`allow`** | Whole values never masked (case-insensitive); use it to fix false positives |
 | **`noRestoreTools`** | Extra tool names whose arguments are not restored (wildcard, `*` matches any string; case-insensitive) |
 | **`restoreTools`** | Tool names allowed to restore (wildcard). `mcp__*` tools are not restored by default; local MCP goes here |
+
+Data directory contents: `key` (HMAC key, 0600), `config.json`, `model/`, `cache/finds.sqlite` (persistent recognition cache, 0600, in a 0700 directory), `slots/` (cross-process inference slots), `tern/` (Tern status files), `list-key-taken` (marker). Everything except `key`, `config.json` and `model/` is derived data and safe to delete while no omp is running.
 
 Environment variables: `PII_GUARD_DIR` (data directory, default `~/.omp/agent/pii-guard`), `PII_GUARD_MODEL_DIR` (model directory, default `<data directory>/model`), `PII_GUARD_MODEL_SRC` (local cache to copy the model from, default `~/.cache/magpie/astrlink-guard/7216b6a3b897`; the `int8/` directory under it is also accepted), `OMP_PII_GUARD`, `PII_GUARD_NO_RESTORE` (above).
 
@@ -329,7 +364,10 @@ Don't put code under `~/.omp/agent/extensions` while developing (every new sessi
 - Original text carried in thinking blocks can't be changed; the session title is generated by the model from the already-masked first message and may contain placeholders; both show placeholders.
 - The network layer doesn't restore responses; a placeholder the model rewrites (case, truncation) can't be restored.
 - Later codex turns send only the increment in `input` (the history lives on the server); back-filled masking affects only later requests.
-- The first time you open a very long old session, wait for the background prescan (measured: 17.7 s for a 504 KB mixed history, about 35 ms per KB, 4 threads, see [Performance](#performance)); when a scan goes over budget it is handled fail-closed instead of sending the original.
+- The first time you open a very long old session **with nothing in the cache yet**, the background prescan of what will be sent takes a while (measured: 17.7 s for a 504 KB mixed history on its own, about 35 ms per KB, 4 threads; when many processes start at once they queue for the shared slots, so it can be longer, see [Performance](#performance)); after that the persistent cache makes the same session start without rescanning. A request sent before the prescan finishes infers the rest itself; when a scan goes over budget it is handled fail-closed instead of sending the original.
+- **The persistent cache is not a security boundary.** `<data dir>/cache/finds.sqlite` holds no text, values or placeholders (keys are HMACs, values are positions, labels and scores), but whoever can write your data directory (your own user, or anything running as you) can edit it, for example store an empty result for a text so it is no longer masked. That is the same level as editing `config.json` (`allow`) and is not defended against. The directory is 0700 and the files 0600; to clear it, delete `<data dir>/cache/` (`rm -r ~/.omp/agent/pii-guard/cache`); it is rebuilt on the next scan. Positions in a cached result are validated against the text before use, and any cache error (unreadable, corrupt, locked, disk full, a symlinked directory) simply counts as a miss and the text is run through the model as usual; it never lets a request through unmasked.
+- **Cross-process slots only exist between processes running this version.** An omp process still running an older version of the extension doesn't take part and can still run its full set of windows at once; restart those sessions. A slot reclaimed at the same moment by two processes can briefly leave one more slot in use than the total (it lasts until that inference ends). If `<data dir>/slots/` can't be used the extension limits inference in-process only and carries on. `rm -r <data dir>/slots` is always safe when no omp is running.
+- Content from **before** the last compaction is not prescanned (it isn't sent). `/clear` boundaries are not recognised for this, so some already-cleared content may still be scanned: that errs on the side of scanning more.
 - Resident memory is about +100 MB under Bun (model included; measured +108 MB after warm-up, see [Performance](#performance)).
 - CLI subcommands that don't load extensions, such as `omp commit`, are not covered.
 - URLs, IPs and dates are not masked; images and PDFs are not handled; magpie's custom masking words are not supported.
@@ -340,7 +378,7 @@ Don't put code under `~/.omp/agent/extensions` while developing (every new sessi
 ```sh
 bun test                # with Bun
 BUN_BE_BUN=1 omp test   # without Bun: the omp binary ships Bun (use your install path, e.g. Tern's omp/versions/18.18.1)
-bun run bench           # the benchmark behind the Performance section
+bun run bench           # the benchmark behind the Performance section (`bun run bench restore`: many sessions at once)
 ```
 
 Re-record the demo GIFs in `docs/demo/` (needs [vhs](https://github.com/charmbracelet/vhs), tmux, gifsicle, an omp 18.18.x binary, and the model on disk; macOS: `brew install vhs tmux gifsicle`; the recordings use the Sarasa Mono SC font, `brew install --cask font-sarasa-gothic`):
@@ -352,7 +390,7 @@ OMP_BIN=/path/to/omp PII_GUARD_MODEL_DIR=~/.cache/magpie/astrlink-guard/7216b6a3
 
 It runs a real omp (this extension, a temporary HOME and data directory, a fake API key; `~/.omp` is not touched) against `docs/demo/mock-server.ts`, a local mock of the Anthropic Messages API on 127.0.0.1 that prints the last user message it receives and replies from a fixed template quoting the placeholders. `demo.zh-CN.tape` and `demo.en.tape` hold the typing script.
 
-The tests include the magpie cases ported in T2, pipeline / entry / network-layer tests driven by a fake recognizer (a local http and WebSocket server checks the real bytes), and real-model tests (the model directory defaults to the magpie cache; they are skipped if it doesn't exist). The timing numbers are not asserted in tests, because timings are flaky.
+The tests include the magpie cases ported in T2, pipeline / entry / network-layer tests driven by a fake recognizer (a local http and WebSocket server checks the real bytes), the prescan scope (`test/scope.test.ts`), the persistent cache (`test/cache.test.ts`: no plaintext in the file, permissions, corruption, tampering, eviction, and child processes reading and writing the same database or creating it at the same moment) and the cross-process slots (`test/slots.test.ts`: child processes competing, `kill -9` reclaim, only your own slot file removed), and real-model tests (the model directory defaults to the magpie cache; they are skipped if it doesn't exist). The timing numbers are not asserted in tests, because timings are flaky.
 
 `tern-plugin/` (Luau, runs inside a Tern window) has no automated tests; the writer of the state file (`src/tern.ts`) is covered by `test/tern.test.ts`. After changing the plugin, check it in Tern: `tern plugin install tern-plugin --force`, run an omp with this extension in a Tern pane (it can talk to a local mock server), and confirm the status-line segment, the click details, and that it disappears when omp exits.
 

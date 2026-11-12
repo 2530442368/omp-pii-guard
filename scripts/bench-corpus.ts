@@ -244,3 +244,20 @@ export function jsonToolOutput(r: Rand, bytes: number): string {
   }
   return `{"query":"retry","total":${rows.length},"results":[\n${rows.join(",\n")}\n]}`;
 }
+
+/**
+ * 批量恢复基准用的合成会话历史：约 bytes 字节，由中/英文背景段、搜索结果 JSON、带标注个人信息的文本轮流组成；
+ * 固定 seed 产出固定内容，不同 seed（即不同会话）内容互不相同。
+ */
+export function restoreHistory(seed: number, bytes: number): string[] {
+  const r = rng(seed);
+  const withPii = annotated(seed, 8).map((d) => d.text);
+  const out: string[] = [];
+  let n = 0;
+  for (let i = 0; n < bytes; i++) {
+    const t = [() => background(r, "zh", 4096), () => background(r, "en", 4096), () => jsonToolOutput(r, 4096), () => withPii[Math.floor(i / 4) % withPii.length]!][i % 4]!();
+    out.push(t);
+    n += Buffer.byteLength(t);
+  }
+  return out;
+}

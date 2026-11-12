@@ -1200,3 +1200,48 @@ describe("返工第 2 轮：$$…$$ 按来源信任（S-F2）", () => {
     expect(out).not.toContain("GGGG11112222");
   });
 });
+
+describe("持久缓存与跨进程槽位的接线", () => {
+  const mode = (p: string): number => fs.statSync(p).mode & 0o777;
+
+  test("缓存与槽位目录都惰性创建：只建出运行时不碰磁盘", () => {
+    testHooks.runtime();
+    expect(fs.existsSync(path.join(dir, "cache"))).toBe(false);
+    expect(fs.existsSync(path.join(dir, "slots"))).toBe(false);
+  });
+
+  test("缓存在 <数据目录>/cache/finds.sqlite、只开一次；目录 0700、文件 0600；Masker 用它", async () => {
+    const rt = testHooks.runtime();
+    const c = testHooks.findCache(rt);
+    expect(c).toBeDefined();
+    expect(testHooks.findCache(rt)).toBe(c);
+    const file = path.join(dir, "cache", "finds.sqlite");
+    expect(mode(path.join(dir, "cache"))).toBe(0o700);
+    expect(mode(file)).toBe(0o600);
+
+    // 先用第一个 Masker 推理一次，结果写进缓存并刷盘
+    const text = "联系人 张伟，电话 13812345678";
+    const rec1 = new FakeRecognizer(VALUES);
+    const m1 = new Masker(async () => rec1, rt.ph, () => rt.config, () => testHooks.findCache(rt));
+    await m1.prescan([{ text, args: false }]);
+    expect(rec1.calls.length).toBe(1);
+    c!.flush();
+
+    // 换一个新的进程单例（同一数据目录）：已扫过的文本零推理
+    testHooks.reset();
+    const rt2 = testHooks.runtime();
+    const rec2 = new FakeRecognizer(VALUES);
+    const m2 = new Masker(async () => rec2, rt2.ph, () => rt2.config, () => testHooks.findCache(rt2));
+    await m2.prescan([{ text, args: false }]);
+    expect(rec2.calls.length).toBe(0);
+  });
+
+  test("Limiter 第一次运行才建 slots 目录（0700），槽位用完即释放", async () => {
+    const rt = testHooks.runtime();
+    await rt.limiter.run(async () => {
+      expect(fs.readdirSync(path.join(dir, "slots")).length).toBe(1);
+    });
+    expect(mode(path.join(dir, "slots"))).toBe(0o700);
+    expect(fs.readdirSync(path.join(dir, "slots"))).toEqual([]);
+  });
+});

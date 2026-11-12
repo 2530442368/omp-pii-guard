@@ -12,13 +12,15 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { ALL_KINDS, envDisabled, envNoRestore, loadConfig, paths, type Config, type Paths } from "./config.ts";
-import { AstrGuard, Limiter } from "./guard.ts";
+import { openFindCache, type FindCache } from "./cache.ts";
+import { AstrGuard, Limiter, MODEL_REVISION } from "./guard.ts";
 import { LocalLiterals } from "./local.ts";
 import { LIST_MAX_VALUE, openValueList, type ListItem } from "./list-ui.ts";
 import { clearMarker, markerState, writeMarker } from "./listkey.ts";
 import { MaskTimeout, Masker } from "./mask.ts";
 import { detectFormat, formatForApi, maskPayload, type TextItem, type TextMasker } from "./payload.ts";
 import { PH_RE, Placeholders, loadKey, restorePolicy } from "./placeholder.ts";
+import { openGlobalSlots, type GlobalSlots } from "./slots.ts";
 import { defaultCacheDir, setupModel } from "./setup.ts";
 import { TernWriter, ternPane, type TernBody } from "./tern.ts";
 import { addLlmOrigin, installTransport, transportProblems } from "./transport.ts";
@@ -69,6 +71,10 @@ interface Runtime {
   versionChecked: boolean;
   /** 在 Tern 里运行（有 TERN_PANE）时的状态文件写入器；否则 undefined。 */
   tern: TernWriter | undefined;
+  /** debug 日志出口（session 工厂运行后接到 pi.logger；之前是空操作）。只写原因与路径，不写任何原值。 */
+  debug: (m: string) => void;
+  /** 持久识别缓存：第一次用到时才打开、只开一次；打不开为 undefined（本进程不用缓存）。 */
+  cache: { opened: boolean; value: FindCache | undefined };
   /** 列表快捷键对本扩展可用：已注册、且 session_start 时确认没有别的绑定占着它（写进 Tern 状态文件的 list，插件据此决定发不发键）。 */
   listKey: boolean;
   stats: { bprRequests: number; bprChanged: number; bprFailed: number; bprFallbackToNet: number; netRequests: number; netRefused: number; netChanged: number; failures: number };
@@ -87,7 +93,7 @@ function runtime(): Runtime {
   const rt: Runtime = {
     paths: p,
     config,
-    limiter: new Limiter(Math.max(1, Math.floor(cores / config.threads))),
+    limiter: undefined as unknown as Limiter,
     ph,
     masker: undefined as unknown as Masker,
     guardP: undefined,
@@ -104,11 +110,28 @@ function runtime(): Runtime {
     shellsPending: 0,
     setupP: undefined,
     tern: undefined,
+    debug: () => {},
+    cache: { opened: false, value: undefined },
     listKey: false,
   };
+  // 跨进程槽位：总数 = 核数/线程数；后台（预扫描）只占一半核的份额。第一次推理时才建目录，没用到推理的进程不碰磁盘。
+  const total = Math.max(1, Math.floor(cores / config.threads));
+  const background = Math.max(1, Math.floor(Math.floor(cores / 2) / config.threads));
+  let slots: GlobalSlots | undefined;
+  let slotsOpened = false;
+  const lazySlots: GlobalSlots = {
+    acquire: async (bg) => {
+      if (!slotsOpened) {
+        slotsOpened = true;
+        slots = openGlobalSlots({ dir: path.join(p.root, "slots"), total, background, debug: (m) => rt.debug(m) });
+      }
+      return slots ? slots.acquire(bg) : () => {};
+    },
+  };
+  rt.limiter = new Limiter(total, lazySlots);
   const pane = ternPane();
   if (pane !== undefined) rt.tern = new TernWriter(path.join(p.root, "tern"), pane);
-  rt.masker = new Masker(() => recognizer(rt), ph, () => rt.config);
+  rt.masker = new Masker(() => recognizer(rt), ph, () => rt.config, () => findCache(rt));
   rt.masker.configChanged(); // 阈值、类别、允许词先生效（映射恢复、补遮都按它过滤）
   G[RT] = rt;
   return rt;
@@ -117,8 +140,10 @@ function runtime(): Runtime {
 /** 测试用：取得 / 清掉进程单例。 */
 export const testHooks = {
   runtime,
+  findCache,
   reset(): void {
     G[RT]?.tern?.dispose();
+    G[RT]?.cache.value?.close();
     G[RT] = undefined;
   },
 };
@@ -129,6 +154,20 @@ function confirm(rt: Runtime, ph: string): void {
   rt.confirmed.delete(ph);
   rt.confirmed.add(ph);
   if (rt.confirmed.size > MAX_CONFIRMED) rt.confirmed.delete(rt.confirmed.values().next().value as string);
+}
+
+/** 持久识别缓存：惰性打开、只开一次（打不开就是 undefined，只记 debug）；进程退出时由缓存自己的 exit 钩子刷盘。 */
+function findCache(rt: Runtime): FindCache | undefined {
+  if (!rt.cache.opened) {
+    rt.cache.opened = true;
+    rt.cache.value = openFindCache({
+      file: path.join(rt.paths.root, "cache", "finds.sqlite"),
+      key: () => loadKey(rt.paths.keyFile),
+      revision: MODEL_REVISION,
+      debug: (m) => rt.debug(m),
+    });
+  }
+  return rt.cache.value;
 }
 
 function recognizer(rt: Runtime): Promise<AstrGuard> {
@@ -271,6 +310,7 @@ export default function piiGuard(pi: any): void {
   const queue: TextItem[] = [];
   let scanning = false;
   const local = new LocalLiterals();
+  rt.debug = (m) => pi.logger?.debug?.(m);
   if (rt.tern) rt.tern.debug = (m) => pi.logger?.debug?.(m);
 
   /** Tern 状态文件：只有主会话的交互界面（有 UI、非子代理、TUI）才认领；后认领的会话为准。 */
@@ -281,6 +321,7 @@ export default function piiGuard(pi: any): void {
   };
   pi.on("session_shutdown", async () => {
     rt.tern?.release(ternOwner);
+    rt.cache.value?.flush(); // 只刷盘不关闭：进程还在、别的会话（子代理）还要用；关闭交给缓存自己的 exit 钩子
     return undefined;
   });
 

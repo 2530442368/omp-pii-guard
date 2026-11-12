@@ -2,10 +2,11 @@
 // 默认只用公开、可复现的语料：固定种子的合成文本（scripts/bench-corpus.ts）、`npm ci` 装出来的 node_modules
 // 里的依赖源码、本仓库的 src/；不读任何私有目录。输出 Markdown 表（stdout），并可选写 JSON。
 //
-//   bun scripts/bench.ts [all|speed|effect|sweep]        （没有 Bun 时：BUN_BE_BUN=1 <omp 二进制> run scripts/bench.ts …）
+//   bun scripts/bench.ts [all|speed|effect|sweep|restore]        （没有 Bun 时：BUN_BE_BUN=1 <omp 二进制> run scripts/bench.ts …）
 //     all     默认：下面全部，THREADS 线程（默认 4）
 //     speed   只测速度
 //     effect  只测效果
+//     restore 批量恢复：N 个进程同时启动、各自预扫一份不同的合成历史，冷/热缓存两轮（详见 scripts/bench-restore.ts）
 //     sweep   线程扫描：对 1/2/4/8 线程各起一个子进程（冷加载、单窗口、各类型 ms/KB、预扫描 500 KB）
 //
 // 环境变量：
@@ -729,4 +730,5 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+if (mode === "restore" || mode === "restore-child") await (await import("./bench-restore.ts")).run(mode);
+else await main();

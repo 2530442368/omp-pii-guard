@@ -348,6 +348,28 @@ describe("持久识别缓存：多进程", () => {
   }, 60_000);
 });
 
+describe("持久识别缓存：同时首次创建", () => {
+  test("十几个子进程在同一时刻首次打开一个不存在的数据库：都能打开，不出现 database is locked", async () => {
+    const worker = path.join(import.meta.dir, "cache-worker.ts");
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const startAt = Date.now() + 1500; // 留出各进程启动的时间，到点一起打开
+    const ids = Array.from({ length: 14 }, (_, i) => `p${i}`);
+    const procs = ids.map((id) =>
+      Bun.spawn([process.execPath, "run", worker], {
+        env: { ...process.env, BUN_BE_BUN: "1", CACHE_FILE: file, CACHE_ID: id, CACHE_N: "5", CACHE_START_AT: String(startAt) },
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    );
+    const results = await Promise.all(procs.map(async (p) => ({ code: await p.exited, out: await new Response(p.stdout).text(), err: await new Response(p.stderr).text() })));
+    for (const r of results) {
+      expect(r.err).toBe("");
+      expect(r.out).toBe("ok");
+      expect(r.code).toBe(0);
+    }
+  }, 60_000);
+});
+
 describe("Masker 接入持久缓存", () => {
   test("第二个 Masker（新进程等价：新实例、同一数据库）对已扫文本零推理，产出相同", async () => {
     const c1 = open();

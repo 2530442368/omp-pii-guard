@@ -120,13 +120,27 @@ flowchart TB
 | **`before_provider_request`（主路径）** | 按 `ctx.model.api` 选格式——`anthropic-messages`、`openai-responses`、`openai-codex-responses`、`openai-completions`；其他 api（含 `devin-agent`）一律失败。内部截止 25 s（omp 的处理器 30 s 超时后会发出原文）。超时时若网络层在位且请求可识别，放行交给网络层（它没有 30 s 限制，上限 180 s）；否则 `return {}`（请求不发出） |
 | **网络层兜底** | 覆盖不经 bpr 的直连：标题直连、本地/远端压缩、judge 等。包装 `globalThis.fetch`、`globalThis.WebSocket`（按连接排队保序）、`http.ClientRequest.prototype.write/end` |
 | **跨层缓存** | 识别结果按文本 sha256 缓存（LRU，键含 args 语境与配置指纹，同一文本只推理一次）；有改动的遮挡产出按同样的键记入缓存，第二层遇到时不重复推理，换语境则不命中 |
-| **后台预扫描** | 用 `ctx.setTimeout`：`session_start` 扫整条分支，`input`/`tool_result`/`assistant_message`/`tool_call` 到达时扫新内容，出口大多命中缓存 |
+| **后台预扫描** | 用 `ctx.setTimeout`：`session_start`（以及 `switch`/`branch`/`tree`）只扫下一次请求真正会带上的部分：**最后一次压缩**的摘要，加上从它的 `firstKeptEntryId` 起的条目（没有压缩时扫整条分支）；`input`/`tool_result`/`assistant_message`/`tool_call` 到达时扫新内容，出口大多命中缓存。压缩之前的内容不预扫：它不会被发出，真要发出时出口照常遮挡，只是没有提前扫 |
+| **持久缓存与全进程共用的推理额度** | 模型的原始结果还会存到磁盘、跨重启复用；本机所有 omp 进程共用同一组推理槽位（见下一小节） |
 
 **网络层处理哪些请求。** 只处理发往 LLM 推理端点的请求：路径（不含查询串）以 `/messages`、`/messages/count_tokens`、`/responses`、`/responses/compact`、`/chat/completions`、`/completions` 结尾（含 codex 的 ws `…/responses`），**且**来源是已知 LLM 服务，或体是 LLM 形状。已知 LLM 服务按 **origin**（协议 + 主机 + 有效端口；`ws`/`wss` 并入 `http`/`https`；默认端口 80/443）判定，来源 = 内置 `https://api.anthropic.com`、`https://api.openai.com`、`https://chatgpt.com` + omp 模型注册表（`ctx.models.list()`，已认证的可用模型）里各 provider 的 `baseUrl` + bpr 里见到的 `ctx.model.baseUrl` + 环境变量里的提供方基址覆盖（`*_BASE_URL`，如 `ANTHROPIC_BASE_URL`：omp 按它改发请求，`ctx.model.baseUrl` 不反映）。同主机的别的端口、别的协议不是同一个来源（本机网关在 3425，3000 端口上的 MCP 服务不受影响）。
 
 - **已知服务**的推理端点：体必须能遮挡。`Blob`、`ReadableStream`、`URLSearchParams` 体完整读取后处理，WebSocket 二进制帧按 UTF-8 解码后处理；无法解码、无法解析、认不出格式的体一律不发出。WebSocket JSON 帧：`type` 为 `response.create` 的走遮挡；其他帧必须有字符串 `type`，且所有字符串值都在 `type`、`id`、`event_id`、`response_id`、`item_id`、`previous_response_id` 键下才放行，否则不发出（包括 bpr 失败后 omp 发出的空壳 `{}`）。
 - **未知来源**的推理路径：认不出、解析不了、不支持编码的体原样放行（未知来源上的 MCP SSE `/messages`、聊天软件 `/channels/1/messages` 等普通 JSON 不受影响）；LLM 形状的体照常遮挡，遮挡失败仍不发出。
 - **其他请求**（同主机的 oauth、models 列表，路径不符的 JSON）字节不变。fetch 先合成实际生效的 `Request`（`new Request(input, init)` 语义）再取头、解码、改写。支持 `content-encoding` identity/gzip/deflate/br，改写后重新压缩并更新 `Content-Length`；已知服务上 zstd 等不支持的编码 → 不发出。
+
+### 重启与批量恢复
+
+一次恢复几十个会话（比如终端管理器恢复一个窗口）时，过去每个 omp 进程都加载模型、把整条历史重扫一遍，所有核被占满。下面三件事把它降下来，都不改变“遮什么”。
+
+| | |
+| :-- | :-- |
+| **只预扫会发出的部分** | 见上面的“后台预扫描”：范围是最后一次压缩的摘要和 `firstKeptEntryId` 之后的内容。在 16 个真实恢复会话上，这是 5.3 MB 对 19.2 MB（少 72.6%）；没有压缩的会话不变 |
+| **持久识别缓存** | `<数据目录>/cache/finds.sqlite`（`bun:sqlite`，WAL）。一段文本一行：键 = 用你的密钥文件和模型修订对文本做的 HMAC-SHA256，值 = 模型的原始结果（位置、标签、分数）和最近使用日。**不存原文、原值、占位符。** 新进程遇到见过的文本就不再过模型；阈值、过滤、已知值补遮和替换照常在其上运行，与新推理出的结果完全一样。换模型修订或密钥不会命中。读出时逐行校验，不合法按未命中。最多 200 000 行，超出后按最近使用日淘汰到 90%。写入批量合并（200 行或 3 s），退出时刷盘。文件损坏会删除重建一次（它是派生数据）；仍打不开就在该进程里关掉缓存 |
+| **全进程共用的推理额度** | `<数据目录>/slots/` 里有 `总数 = max(1, floor(核数 / 线程数))` 个槽位文件（14 核、4 线程时是 3 个）。推理一个窗口占一个槽位，所以不管有多少个 omp 进程，机器上同时在跑的窗口不超过总数。后台预扫描只能用前 `max(1, floor(floor(核数 / 2) / 线程数))` 个槽位（14 核、4 线程时是 1 个）；出口请求可以用全部槽位，并优先试预扫描用不到的那些，所以不会被预扫描堵住。槽位是排他创建的文件（0600，内容 `pid token 时间`）；等待是带退避与抖动的轮询；持有者 pid 已死或文件超过 120 s 的槽位会被回收；进程退出时释放自己的。目录用不了就只做进程内限流，推理不会因此被阻塞 |
+| **关掉 ORT 线程自旋** | ORT 的算子内、算子间线程池都设 `allow_spinning=0`。空闲线程不再忙等耗 CPU，多个进程争核时收益最大（实测见下） |
+
+批量恢复的实测数字见[性能](#性能)；缓存与槽位的限制见[局限](#局限)。
 
 ### 失败即不发，也不引发重试风暴
 
@@ -203,9 +217,25 @@ tern plugin remove pii-guard                          # 卸载
 | **新增工具输出** | 在已缓存的历史上再加 20.2 KB 全新的 JSON 工具输出：1047 ms（1044 / 1048 / 1047 ms），主要是推理 |
 | **已知值补遮** | 1 Mi 字符 × 1000 个已知值，命中 4187 处：新建索引 25.9 ms（31.1 / 24.6 / 25.9 ms），索引已缓存 24.5 ms |
 
-一句话：时间主要花在模型上，4 线程下每 KB 新文本约 25–50 ms，所以一段 20 KB 的工具结果让它的第一次请求多出约一秒，已经见过的内容不再花时间。
+以上单进程各行是在加入持久缓存与跨进程槽位之前测的；单个进程自己的推理不涉及这两者，线程自旋对单独运行的进程也没有影响（见下面“批量恢复”）。一句话：时间主要花在模型上，4 线程下每 KB 新文本约 25–50 ms，所以一段 20 KB 的工具结果让它的第一次请求多出约一秒，已经见过的内容不再花时间。
 
 预扫描与出口两行用的历史由四种内容轮流构成：中文散文、英文散文、依赖源码里的代码、JSON 工具输出（合成，不含个人信息）。吞吐数字每种内容约取 64 KB，切成约 4 KB 一段（代码：不足 20 KB 的整文件）。
+
+### 一次恢复很多会话
+
+`bun run bench restore`：8 个全新的类 omp 进程在同一时刻启动（就像终端管理器恢复一个窗口的会话），各自加载真实模型，并预扫描**各自不同**的约 300 KB 合成历史（中英文散文、JSON 工具输出、带标注的虚构个人信息文本；合计 765 段文本送进模型），每个进程 4 线程，同一台 14 核机器，2026-11-12。进程里的接线与扩展一致（进程内限流 + 跨进程槽位 + 持久缓存；模型一开始就加载）。基线是上一个提交 `bd45b51`（每个进程各自的进程内限流，没有持久缓存、没有跨进程槽位、线程自旋开着），用同一个脚本通过 `PII_BENCH_SRC` 驱动。机器当时在被别的工作共用：新代码这轮开始时负载 3.8，基线开始时 4.2；“峰值忙核数”量的是整机（新代码这轮的 8.8 里约有 4 个是别的进程），“CPU 时间”只统计基准自己的进程。
+
+| | 墙钟 | CPU 时间（8 个进程之和） | 峰值忙核数（整机） | 峰值 1 分钟负载 | 送进模型的文本数 |
+| --- | --- | --- | --- | --- | --- |
+| 之前（`bd45b51`），每次启动 | 66.8 s | 823.5 s | 14.0（全部核） | 28.2 | 765 |
+| 现在，第一次启动，缓存为空 | 88.4 s | 330.7 s（−60%） | 8.8 | 5.1 | 765 |
+| 现在，第二次启动，同样的历史 | 0.2 s | 1.3 s | n/a（不足 1 s 采样间隔） | 4.7（无变化） | 0 |
+
+怎么读：缓存为空时，跨进程额度（这台机器上后台只有 1 个槽位）用一些墙钟时间（+32%）换来轻得多的机器：CPU 时间少 60%，负载停在原来的水平附近而不是冲到 28，机器上别的事照常跑。缓存已热时，同样的恢复每个进程只花约 0.16 s CPU（会话启动时仍会加载模型，加上缓存查询），一段文本都不送进模型。每 50 ms 采样一次槽位目录，新代码的几轮里同时被占用的槽位文件从未超过 1 个（后台上限）。峰值负载是 1 分钟平均，会滞后；基线的 28 在结束时还在上升。
+
+单独核对**线程自旋**的效果（6 个进程 × 100 KB，每进程 4 线程，两种变体都没有跨进程槽位和缓存，所以是 72 个推理线程争 14 个核；同样的 `bd45b51` 代码，分别带与不带 `allow_spinning=0`，各跑两次）：CPU 时间 197.9 / 196.0 s → 103.8 / 104.1 s（−47%），墙钟 15.2 / 15.4 s → 10.1 / 8.8 s。单个进程自己跑时不受影响（一个窗口、4 线程：没测出差别）。
+
+这个基准里的历史是合成的、由短文本构成，所以数字说明的是机制，不是你的会话。真实恢复 21 个大小不一的会话会有差别；用 `PII_BENCH_RESTORE_PROCS=21` 可以跑那么多个。
 
 ### 线程数
 
@@ -270,7 +300,10 @@ npm ci --ignore-scripts      # 或用扩展自己的安装；依赖语料就是 
 bun run bench                # 全部，4 线程（约 2 分钟）
 bun run bench sweep          # 线程扫描：1、2、4、8 线程，各起一个全新进程（约 10 分钟）
 bun run bench speed          # 或：effect
+bun run bench restore        # 一次恢复很多会话：先冷缓存后热缓存（默认参数约 2 分钟）
 ```
+
+`bench restore` 的基线：`git worktree add /tmp/pii-baseline bd45b51`，把 `node_modules` 复制或链接进去，然后 `PII_BENCH_SRC=/tmp/pii-baseline/src PII_BENCH_RESTORE_ROUNDS=1 bun run bench restore`（源码目录里没有 `cache.ts` / `slots.ts` 就按旧接线）。开关：`PII_BENCH_RESTORE_PROCS`（默认 8）、`PII_BENCH_RESTORE_KB`（默认 300）、`PII_BENCH_RESTORE_ROUNDS`（默认 2）。前后记一下 `uptime`：只有机器负载相近时数字才可比。
 
 模型目录取 `PII_GUARD_MODEL_DIR`，其次 `<数据目录>/model`，再其次 magpie 缓存；先运行 `/pii setup`。其他开关：`THREADS`、`PII_BENCH_JSON=out.json`（把结果写成 JSON）、`PII_BENCH_SEED`、`PII_BENCH_PER_KIND`、`PII_BENCH_REPS`。默认运行只读合成生成器（`scripts/bench-corpus.ts`）、`node_modules` 和 `src/`。想加上自己的代码或 omp 会话，设置 `PII_BENCH_DIRS` / `PII_BENCH_SESSIONS`；它们只输出计数与形状，不输出值。
 
@@ -299,6 +332,8 @@ bun run bench speed          # 或：effect
 | **`allow`** | 永不遮挡的整值（不分大小写），修误报用 |
 | **`noRestoreTools`** | 追加的不还原工具名（通配，`*` 匹配任意串；不分大小写） |
 | **`restoreTools`** | 放行还原的工具名（通配）。`mcp__*` 工具默认不还原，本地 MCP 在这里放行 |
+
+数据目录里的内容：`key`（HMAC 密钥，0600）、`config.json`、`model/`、`cache/finds.sqlite`（持久识别缓存，0600，所在目录 0700）、`slots/`（跨进程推理槽位）、`tern/`（Tern 状态文件）、`list-key-taken`（标记文件）。除 `key`、`config.json`、`model/` 之外都是派生数据，没有 omp 在运行时可以放心删除。
 
 环境变量：`PII_GUARD_DIR`（数据目录，默认 `~/.omp/agent/pii-guard`）、`PII_GUARD_MODEL_DIR`（模型目录，默认 `<数据目录>/model`）、`PII_GUARD_MODEL_SRC`（复制模型的本机缓存目录，默认 `~/.cache/magpie/astrlink-guard/7216b6a3b897`，也认其下的 `int8/`）、`OMP_PII_GUARD`、`PII_GUARD_NO_RESTORE`（见上）。
 
@@ -329,7 +364,10 @@ scripts/install.sh
 - 思考块里带有的原文不可改；会话标题由模型对已遮挡的首条消息生成，可能带占位符；两者显示占位符。
 - 不在网络层还原响应；模型改写占位符（大小写、截断）时无法还原。
 - codex 后续轮次的 `input` 只含增量（历史在服务端）；回溯补遮只影响之后的请求。
-- 首次打开很长的旧会话要等后台预扫描（实测 504 KB 混合历史 17.7 s，约 35 ms/KB，4 线程，见[性能](#性能)）；扫描超预算时按 fail-closed 处理，而不是发出原文。
+- **缓存里还没有**的很长的旧会话，第一次打开时要等后台预扫描“将要发出的部分”（实测：504 KB 混合历史单独扫 17.7 s，约 35 ms/KB，4 线程；很多进程同时启动时要排队等共用的槽位，会更久，见[性能](#性能)）；之后持久缓存让同一个会话再启动时不必重扫。预扫描没扫完就发出的请求，剩下的由它自己推理；扫描超预算时按 fail-closed 处理，而不是发出原文。
+- **持久缓存不是安全边界。** `<数据目录>/cache/finds.sqlite` 里没有原文、原值和占位符（键是 HMAC，值是位置、标签、分数），但能写你数据目录的人（你自己的用户，或以你的身份运行的任何程序）可以改它，例如给某段文本存一个空结果，使它不再被遮挡。这与修改 `config.json` 的 `allow` 同级，不做防护。目录 0700、文件 0600；要清空就删掉 `<数据目录>/cache/`（`rm -r ~/.omp/agent/pii-guard/cache`），下次扫描时会重建。缓存里的位置在使用前会对照文本校验，任何缓存错误（读不了、损坏、被锁、磁盘满、目录是符号链接）都只当作未命中，文本照常过模型，绝不会因此放行未遮挡的请求。
+- **跨进程槽位只存在于运行本版本的进程之间。** 仍在运行旧版扩展的 omp 进程不参与，仍可能一次跑满自己那一组窗口；请重启这些会话。同一个槽位被两个进程同时判定过期并回收时，可能短暂比总数多占用一个槽位（持续到那次推理结束）。`<数据目录>/slots/` 用不了时，扩展只做进程内限流并继续工作。没有 omp 在运行时，`rm -r <数据目录>/slots` 总是安全的。
+- 最后一次压缩**之前**的内容不预扫（它不会被发出）。`/clear` 的边界这里不识别，所以一些已被清掉的内容可能仍会被扫：这是“多扫”的安全方向。
 - 常驻内存约 +100 MB（Bun 下，含模型；实测热身后 +108 MB，见[性能](#性能)）。
 - `omp commit` 等不加载扩展的 CLI 子命令不覆盖。
 - 不遮 URL/IP/日期；不处理图片/PDF；不做 magpie 的自定义遮挡词。
@@ -340,7 +378,7 @@ scripts/install.sh
 ```sh
 bun test                # 有 Bun 时
 BUN_BE_BUN=1 omp test   # 没有 Bun 时：omp 二进制自带 Bun（路径按你的安装位置，如 Tern 的 omp/versions/18.18.1）
-bun run bench           # 生成“性能”一节数字的基准
+bun run bench           # 生成“性能”一节数字的基准（`bun run bench restore`：一次恢复很多会话）
 ```
 
 重录 `docs/demo/` 里的演示动图（需要 [vhs](https://github.com/charmbracelet/vhs)、tmux、gifsicle、omp 18.18.x 二进制和本机已有的模型；macOS：`brew install vhs tmux gifsicle`；录制用 Sarasa Mono SC 字体，`brew install --cask font-sarasa-gothic`）：
@@ -352,7 +390,7 @@ OMP_BIN=/path/to/omp PII_GUARD_MODEL_DIR=~/.cache/magpie/astrlink-guard/7216b6a3
 
 它用临时 HOME 与数据目录、假 API key 起一个真实的 omp（加载本扩展，不碰 `~/.omp`），连到 `docs/demo/mock-server.ts`：监听 127.0.0.1 的 Anthropic Messages 本地模拟，打印收到的最后一条用户消息，并按固定模板引用占位符回复。输入脚本在 `demo.zh-CN.tape` 与 `demo.en.tape`。
 
-含 T2 移植的 magpie 用例、假识别器驱动的管线/入口/网络层测试（本机 http 与 WebSocket 服务器验证真实字节）、真模型测试（模型目录默认 magpie 缓存，不存在则跳过）。测试里不对耗时做断言（耗时易抖）。
+含 T2 移植的 magpie 用例、假识别器驱动的管线/入口/网络层测试（本机 http 与 WebSocket 服务器验证真实字节）、预扫描范围（`test/scope.test.ts`）、持久缓存（`test/cache.test.ts`：文件里没有明文、权限、损坏、篡改、淘汰，以及子进程读写同一个数据库、同一时刻首次创建它）、跨进程槽位（`test/slots.test.ts`：子进程争用、`kill -9` 回收、只删自己的槽位文件）、真模型测试（模型目录默认 magpie 缓存，不存在则跳过）。测试里不对耗时做断言（耗时易抖）。
 
 `tern-plugin/`（Luau，在 Tern 窗口里运行）没有自动化测试；状态文件的写入方（`src/tern.ts`）由 `test/tern.test.ts` 覆盖。改插件要在 Tern 里实测：`tern plugin install tern-plugin --force`，在 Tern 窗格里跑加载本扩展的 omp（可连本地模拟服务端），确认底栏段、点击详情和 omp 退出后消失。
 

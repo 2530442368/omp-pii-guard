@@ -10,7 +10,7 @@
 // - 写入合并成批（定时或攒够一批，一个事务），进程退出前尽力刷盘。
 // - 条数有上限（默认 200 000），超出时按最近使用日淘汰到 90%；命中时只在使用日变了才更新。
 // - 打不开或损坏（NOTADB/CORRUPT/版本不符/不是普通文件）：删除重建一次（纯派生数据）；仍不行则本进程禁用缓存。
-//   “忙/锁”之类的错误不删库（别的进程正在用），只让本次操作失败。
+//   “忙/锁”之类的错误不删库（别的进程正在用），只让本次操作失败；打开时遇到忙/锁（很多进程同时首次创建）带抖动重试。
 
 import { Database } from "bun:sqlite";
 import { createHmac } from "node:crypto";
@@ -120,7 +120,17 @@ function chmodQuiet(f: string): void {
   } catch {}
 }
 
-/** 打开（必要时创建）数据库并确认可用；损坏类问题抛 isCorrupt 为真的错误。 */
+/** 忙/锁（别的进程正在初始化或写入）。 */
+function isBusy(e: unknown): boolean {
+  const code = e instanceof Error && "code" in e ? String(e.code) : "";
+  return code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" || /database is locked|database is busy/i.test(msgOf(e));
+}
+
+const sleepSync = (ms: number): void => void Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+/** 初始化遇到忙/锁时的重试：很多进程同时首次创建数据库（Tern 一次恢复几十个会话）时，切换到 WAL 的那一步不走 busy_timeout，会直接报 locked。 */
+const INIT_RETRIES = 40;
+
+/** 打开（必要时创建）数据库并确认可用；损坏类问题抛 isCorrupt 为真的错误；忙/锁时带抖动重试。 */
 function openDb(file: string): Database {
   let st: fs.Stats | undefined;
   try {
@@ -138,6 +148,17 @@ function openDb(file: string): Database {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
     }
   }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return initDb(file);
+    } catch (e) {
+      if (!isBusy(e) || attempt >= INIT_RETRIES) throw e;
+      sleepSync(10 + Math.random() * 60);
+    }
+  }
+}
+
+function initDb(file: string): Database {
   const db = new Database(file, { create: true, readwrite: true });
   try {
     db.exec("PRAGMA busy_timeout=2000");

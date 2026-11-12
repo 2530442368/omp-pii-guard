@@ -27,14 +27,16 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/index.ts` | 扩展入口：`/pii` 命令（状态、`list`、`setup`、`on`/`off`）与快捷键 `LIST_KEY`（仅在 `list-key-taken` 标记（`src/listkey.ts`：lstat 判断、只认普通文件；写入走 `ensureOwnDir` + `atomicWriteNew`，不写穿符号链接）不存在时注册，所以首次遇到冲突的那一次启动内可能已覆盖对方的绑定（加载期 `getShortcutConflict` 不可用，已知限制），之后启动不再注册；`checkListKey` 在 `session_start` 里用 `getShortcutConflict` 确认并写入 `Runtime.listKey`，状态文件的 `list` 字段；`ctrl+alt+p`，同样打开原值列表）；挂接事件（`session_start`/`switch`/`branch`/`tree`/`compact`、`before_provider_request`、`tool_call`、`assistant_message`、`input`、`tool_result`）和助手文本渲染器；进程级单例 `Runtime`（`globalThis[Symbol.for("omp-pii-guard.runtime")]`）；`testHooks` 供测试重置 |
+| `src/index.ts` | 扩展入口：`/pii` 命令（状态、`list`、`setup`、`on`/`off`）与快捷键 `LIST_KEY`（仅在 `list-key-taken` 标记（`src/listkey.ts`：lstat 判断、只认普通文件；写入走 `ensureOwnDir` + `atomicWriteNew`，不写穿符号链接）不存在时注册，所以首次遇到冲突的那一次启动内可能已覆盖对方的绑定（加载期 `getShortcutConflict` 不可用，已知限制），之后启动不再注册；`checkListKey` 在 `session_start` 里用 `getShortcutConflict` 确认并写入 `Runtime.listKey`，状态文件的 `list` 字段；`ctrl+alt+p`，同样打开原值列表）；挂接事件（`session_start`/`switch`/`branch`/`tree`/`compact`、`before_provider_request`、`tool_call`、`assistant_message`、`input`、`tool_result`）和助手文本渲染器；进程级单例 `Runtime`（`globalThis[Symbol.for("omp-pii-guard.runtime")]`）：`runtime()` 里接线——`Limiter(总槽位, 惰性打开的跨进程槽位)`、`Masker` 的持久缓存（`findCache(rt)`，第一次用到才打开、只开一次）、`rt.debug` 日志出口；预扫描范围由 `sentTexts` 决定（最后一次压缩的摘要 + `firstKeptEntryId` 起的条目；`loadBranch` 与 `noteUsed` 仍用整条分支）；`session_shutdown` 只刷缓存不关闭（关闭由缓存自己的 `exit` 钩子做）；`testHooks` 供测试重置 |
 | `src/list-ui.ts` | `/pii list` 的本机界面：`ctx.ui.custom` 里的只读列表组件 `ValueList`（列表/全文两层、滚动、Esc 分层关闭）与 `openValueList`；`visible()` 把控制字符、零宽字符、双向控制字符换成可见转义（`⟨U+202E⟩` 等）。不引用任何 `@oh-my-pi/*` 包，按键由工厂传入的 `keybindings` 判定 |
 | `src/listkey.ts` | 列表快捷键的“被占用”标记文件 `<数据目录>/list-key-taken`：`markerState`（lstat，只有普通文件算标记，符号链接与目录视为异常）、`writeMarker`（沿用 `src/tern.ts` 的 `ensureOwnDir` + `atomicWriteNew`，不写穿符号链接）、`clearMarker`（只删目录项本身） |
 | `src/config.ts` | 路径（`PII_GUARD_DIR`、`PII_GUARD_MODEL_DIR`）、环境开关（`OMP_PII_GUARD`、`PII_GUARD_NO_RESTORE`）、`config.json` 解析与校验（字段非法回落默认并记 `warnings`） |
-| `src/guard.ts` | AstrLink Guard 推理（510 token 窗口、重叠 128、分数下限 0.5）、`MODEL_FILES`（文件名/大小/sha256）与 `verifyModel`、并发闸门 `Limiter`、`Recognizer` 接口（测试换假识别器） |
+| `src/guard.ts` | AstrLink Guard 推理（510 token 窗口、重叠 128、分数下限 0.5；`InferenceSession.create` 带 `extra`：关闭 ORT 线程自旋 `allow_spinning=0`，超订时 CPU 时间约降到三分之一）、`MODEL_FILES`（文件名/大小/sha256）与 `verifyModel`、并发闸门 `Limiter`（进程内名额 + 可选跨进程槽位 `GlobalSlots`；前台排在后台前面）、`Recognizer` 接口（测试换假识别器） |
 | `src/setup.ts` | `/pii setup`：已就绪跳过 → 复制本机 magpie 缓存 → 从固定修订下载；临时文件 + 校验 + 原子替换。**扩展里唯一会联网的代码** |
 | `src/tern.ts` | Tern 状态文件：`TernWriter`（有 `TERN_PANE` 时把当前交互会话的状态写成 `<数据目录>/tern/<TERN_PANE>.json`：临时文件 + rename、0600、500 ms 去抖、退出/关闭时删除、顺手清 pid 已死的残留）、`TernBody`/`TernFile` 契约类型、`ternPane()`。内容由 `src/index.ts` 的 `status()` 产出（与 `/pii` 同一份数据） |
-| `src/mask.ts` | 遮挡管线：推理 → 过滤 → 已知值补遮 → 剪掉与已有占位符相交的部分 → 生成占位符；按文本 sha256 的 LRU 缓存；`$$…$$` / `{{…}}` 保护 |
+| `src/mask.ts` | 遮挡管线：推理 → 过滤 → 已知值补遮 → 剪掉与已有占位符相交的部分 → 生成占位符；按文本 sha256 的内存 LRU 缓存，未命中先查持久缓存（`cache` 参数，第 4 个构造参数，惰性取用）再推理，推理完（含超时后后台完成的）写回；`$$…$$` / `{{…}}` 保护 |
+| `src/cache.ts` | 持久识别缓存（`bun:sqlite`，WAL）：模型原始结果 `RawFind[]`，键 = `HMAC-SHA256(key, "pii-guard/find-cache/v1\0" + MODEL_REVISION + "\0" + 文本)`，值是位置/标签/分数，另有最近使用日。目录 `<数据目录>/cache/` 经 `ensureOwnDir`（0700）、库与 `-wal`/`-shm` 为 0600；读出的行逐项校验；200 000 条上限按最近使用日淘汰到 90%；写入合并批量（200 条或 3 s）、退出时刷盘；损坏删除重建一次，连续出错禁用；很多进程同时首次创建时打开遇忙/锁带抖动重试。任何错误只表现为“未命中” |
+| `src/slots.ts` | 跨进程推理槽位：`<数据目录>/slots/slot-<i>` 文件（`wx` 排他创建、0600，内容 `pid token 时间`），总数 `max(1, 核数/线程)`，后台（预扫描）只能用前 `max(1, 核数/2/线程)` 个；轮询退避加抖动；持有者死亡或文件超过 120 s 视为过期并回收；释放只删自己 token 的文件；退出时同步释放。目录不可用时退回进程内限流 |
 | `src/payload.ts` | 请求体遍历：按格式（`anthropic-messages`、`openai-responses`、`openai-codex-responses`、`openai-completions`）收集可改的字符串叶子并就地写回 |
 | `src/transport.ts` | 网络层兜底：包装 `globalThis.fetch`、`globalThis.WebSocket`、`http.ClientRequest.prototype.write/end`；已知 LLM origin 判定；不发出时合成 422 / WS error 帧 |
 | `src/placeholder.ts` | 占位符生成（HMAC-SHA256）、密钥文件、占位符映射与还原、工具参数还原策略（`restorePolicy`） |
@@ -43,10 +45,10 @@
 | `src/filters.ts`、`zhname.ts`、`email.ts`、`packages.ts`、`ids.ts`、`thingname.ts`、`text.ts` | 误报过滤与中文名补找，移植自 magpie（见 `NOTICE`） |
 | `src/zhdata.ts`、`src/tlds.ts` | 机械生成的数据表（中文姓氏/词表、ICANN 顶级域），文件头注明来源；不要手工增删条目 |
 | `src/types.ts` | `Kind`、`RawFind`、`Span`、`ModelOptions` |
-| `test/*.test.ts` | `bun:test` 用例，每个 `src` 模块对应一个或多个文件（`index`、`list`、`transport`、`mask`、`payload`、`placeholder`、`setup`、`filters`、`known`、`zhname`、`email`、`offsets`、`local`、`perf`、`guard`、`tern`；`list` 覆盖 `/pii list` 与快捷键）；`helpers.ts`（把 magpie 测试里的 fakeModel 换成 AstrLink 标签）、`fake.ts`（`FakeRecognizer`）是辅助 |
+| `test/*.test.ts` | `bun:test` 用例，每个 `src` 模块对应一个或多个文件（`index`、`list`、`transport`、`mask`、`payload`、`placeholder`、`setup`、`filters`、`known`、`zhname`、`email`、`offsets`、`local`、`perf`、`guard`、`tern`、`scope`（预扫描范围）、`cache`（持久缓存，含多进程与同时首次创建）、`slots`（跨进程限流，含真实子进程争用）；`list` 覆盖 `/pii list` 与快捷键）；`helpers.ts`（把 magpie 测试里的 fakeModel 换成 AstrLink 标签）、`fake.ts`（`FakeRecognizer`）、`cache-worker.ts`/`slots-worker.ts`（多进程用例的子进程）是辅助 |
 | `tern-plugin/` | 可选的 Tern 底栏插件（`plugin.toml` + `window.luau`，Luau）：读扩展写的状态文件，在焦点窗格的底栏显示可点击的 PII 段（点击 → 向 omp 窗格发快捷键打开原值列表，命令 `plugin.pii-guard.list`；命令 `plugin.pii-guard.details` 仍是弹统计 toast）。不属于 omp 扩展，不随 `scripts/install.sh` 安装；安装 `tern plugin install <本仓库目录>/tern-plugin --force`。没有自动化测试，改动要在 Tern 里实测（见第 6 节）。formatter 只读缓存、不做 I/O（Tern 限制 4 ms） |
 | `scripts/install.sh` | 克隆后复制安装：校验并复制模型、复制 `src/` 到 omp 的扩展目录并 `npm ci`；模型只从本机缓存复制、不下载，`npm ci` 在依赖未缓存时会联网；不改 omp 配置 |
-| `scripts/bench.ts`、`scripts/bench-corpus.ts` | 基准与固定种子的合成语料生成器；README“性能”一节的数字来自它 |
+| `scripts/bench.ts`、`scripts/bench-restore.ts`、`scripts/bench-corpus.ts` | 基准与固定种子的合成语料生成器；README“性能”一节的数字来自它。`bench-restore.ts` 是 `bench restore`（批量恢复：N 个进程同时启动，各自预扫不同的合成历史，冷/热缓存两轮；`PII_BENCH_SRC` 可指向旧版 src 做基线）|
 | `docs/demo/` | README 的演示动图（`demo.*.gif`）、vhs 脚本（`demo.*.tape`）、本地模拟服务端 `mock-server.ts`、重录脚本 `record.sh` |
 | `README.md`、`README.zh-CN.md` | 中英两份用户文档，内容必须同步 |
 | `NOTICE`、`LICENSE` | 第三方声明、MIT 许可 |
@@ -60,7 +62,7 @@
 | 装依赖（不跑脚本） | `npm ci --ignore-scripts` |
 | 全量测试 | `bun test`，或 `BUN_BE_BUN=1 omp test` |
 | 单个测试文件 | `BUN_BE_BUN=1 omp test test/transport.test.ts` |
-| 基准 | `bun run bench`（全部，约 2 分钟）、`bun run bench speed`、`bun run bench effect`、`bun run bench sweep`（线程扫描，约 10 分钟）；无 Bun：`BUN_BE_BUN=1 omp run scripts/bench.ts [all\|speed\|effect\|sweep]` |
+| 基准 | `bun run bench`（全部，约 2 分钟）、`bun run bench speed`、`bun run bench effect`、`bun run bench sweep`（线程扫描，约 10 分钟）、`bun run bench restore`（批量恢复，冷/热缓存各一轮，约 1–3 分钟；机器负载高时数字不可比，要记下当时的 `uptime`）；无 Bun：`BUN_BE_BUN=1 omp run scripts/bench.ts [all\|speed\|effect\|sweep]` |
 | 开发时加载扩展 | `omp -e <本仓库目录>`（显式加载；**不要**把仓库代码直接放进 `~/.omp/agent/extensions`，那里会被所有新会话加载） |
 | 复制安装 | `scripts/install.sh`；会写入 omp 的 agent 目录（`OMP_AGENT_DIR`，默认 `~/.omp/agent`），仅在用户要求时运行，试跑时用 `OMP_AGENT_DIR`、`PII_GUARD_DIR` 指向临时目录 |
 | 在 omp 里准备模型 | 会话里执行 `/pii setup`（只有它会联网）；`/pii` 看状态；`/pii on`、`/pii off` 开关 |
@@ -70,7 +72,7 @@
 说明：
 
 - 测试里的“真模型”用例（`test/guard.test.ts`、`test/index.test.ts` 的 `/pii setup` 里复制缓存的用例）在模型目录不存在时自动跳过；模型目录默认是 magpie 缓存 `~/.cache/magpie/astrlink-guard/7216b6a3b897`，`test/guard.test.ts` 可用 `PII_GUARD_TEST_MODEL_DIR` 覆盖。其余用例用假识别器，不需要模型。耗时断言只放在 `test/perf.test.ts` 的性能回归用例里（已知值补遮 200 ms、人为最坏情形与 `modelSpans` 1000 ms），其他测试不对耗时做断言。
-- 基准需要模型：依次找 `PII_GUARD_MODEL_DIR`、`<数据目录>/model`、magpie 缓存，找不到就先 `/pii setup`。其他开关：`THREADS`、`PII_BENCH_JSON`、`PII_BENCH_SEED`、`PII_BENCH_PER_KIND`、`PII_BENCH_REPS`、`PII_BENCH_DIRS`、`PII_BENCH_SESSIONS`（见 `scripts/bench.ts` 文件头）。
+- 基准需要模型：依次找 `PII_GUARD_MODEL_DIR`、`<数据目录>/model`、magpie 缓存，找不到就先 `/pii setup`。其他开关：`THREADS`、`PII_BENCH_RESTORE_PROCS`/`_KB`/`_ROUNDS`/`PII_BENCH_SRC`（restore）、`PII_BENCH_JSON`、`PII_BENCH_SEED`、`PII_BENCH_PER_KIND`、`PII_BENCH_REPS`、`PII_BENCH_DIRS`、`PII_BENCH_SESSIONS`（见 `scripts/bench.ts` 文件头）。
 - 重录动图前提：`vhs`、`tmux`、`gifsicle`、omp 18.18.x 二进制（`OMP_BIN`，默认取 PATH 里的 `omp`）、本机已有模型（`PII_GUARD_MODEL_DIR`）、先 `npm ci --ignore-scripts`；`.tape` 里用 Sarasa Mono SC 字体。脚本用临时 HOME 和数据目录，不碰真实的 `~/.omp`。动图是二进制文件，没有这些前提就不要重录，也不要手改 `.tape` 后不重录。
 
 ## 5. 不可破坏的约束
@@ -92,6 +94,10 @@
 13. **子代理与主会话同进程**：模型、缓存、占位符表、网络层包装用 `globalThis` 单例（`Symbol.for("omp-pii-guard.runtime")`、`Symbol.for("omp-pii-guard.transport")`），只装一次；新增全局状态要遵守同一做法，并保证测试里能重置（现有的进程单例由 `testHooks.reset()` 清掉）。
 
 14. **Tern 状态文件是对外契约（版本 1），只含计数与状态。** 文件内容（`TernBody`/`TernFile`，`src/tern.ts`）不得出现任何原值、占位符、会话内容、请求内容；`summary` 来自 `/pii` 的摘要（只有计数、开关和模型加载失败的原因），新增字段前先确认它不会带出这些东西。只有 `TERN_PANE` 是正整数时才写，且只有主会话的交互界面（`ctx.hasUI`、非子代理、`mode` 未给出或为 `tui`）才认领；写入失败一律吞掉（只记 debug），不能影响遮挡、不能让请求失败或放行；写前 lstat 校验状态目录（真实目录、非符号链接、属主是当前用户，权限收紧到 0700，做不到就放弃）；临时文件用随机名 + `wx` 排他创建、0600，再 rename；退出和会话关闭时只删“本实例写过且文件里 pid 是自己”的文件（没认领的进程如 `omp -p` 不得删别人的）。插件把文件当不可信输入，`validate()` 逐项校验后才进缓存，`kill -0` 只对校验过的 pid 调用；新增字段要同步校验（`list` 是可选布尔，缺失当 false，表示列表快捷键已注册且没被别的绑定占用，插件只在它为 true 时发按键）。会话切换（`session_switch`/`branch`/`tree` 不会重跑工厂）时，本会话计数 `used` 由 `loadBranch` 按目标分支里的映射条目重建，`/pii` 与状态文件共用它。改字段含义或格式要提高 `TERN_STATE_VERSION`，同步 `tern-plugin/window.luau`（它只认 `v == 1`）、两份 README 和 `test/tern.test.ts`。插件侧只读这个文件，不得反过来向扩展写东西；唯一的反向动作是点击时向 omp 窗格发送快捷键序列（`window.luau` 的 `LIST_KEY_SEQ` = `ESC[112;7u`，必须与 `src/index.ts` 的 `LIST_KEY` 保持一致，改一处要同步另一处、两份 README 和 `test/list.test.ts`），发之前当场（不用缓存）校验：状态文件有效且 `list == true`、pid 存活、`ps -o stat= -o comm= -p <pid>` 的 stat 含 `+` 且不含 `T`/`Z`（Ctrl+Z 挂起后 pid 仍活着但按键会落进 shell）、可执行文件名为 `omp`（防 pid 被回收复用）、该 pid 环境里的 `TERN_PANE` 等于目标窗格（`ps -Eww` 经 shell 管道的 grep 只取这一个记号；Tern 插件接口不提供窗格的 pid/tty，环境是唯一的关联，读不到按不匹配）、Tern 报告窗格 `kind == "agent"` 或程序名为 `omp`（`fg` 之后 Tern 的程序名会变成 `fg`，所以认 kind）、窗格仍是焦点窗格；任一不满足只 toast 不发送。序列不携带任何数据，插件也不读写任何原值。
+
+15. **持久识别缓存不存原文、原值、占位符，且任何缓存错误都不得导致少遮或原样发出。** `src/cache.ts` 只存 HMAC 键（含 `MODEL_REVISION` 与密钥）、位置/标签/分数与最近使用日；不得新增存文本、值、占位符或可逆推原文的列。读出的行必须逐项校验（整数位置、`0 ≤ start < end ≤ text.length`、标签合法、分数 0–1 有限数），不合法当未命中；打不开、损坏、锁、磁盘满、目录是符号链接一律表现为“未命中 → 照常推理”（`Masker` 里对缓存的每次调用都包在 try/catch 里，且缓存命中只提供 `RawFind[]`，之后仍走同一套阈值、过滤、补遮、替换）；写入失败只记 debug，不抛、不阻塞出口。威胁模型：同一用户能改缓存文件（例如写入空结果让某段文本不被遮挡），与改 `config.json` 的 `allow` 同级，不防，README“局限”写明；缓存是纯派生数据，损坏时删除重建。改键的构成或值格式要同步 `SCHEMA_VERSION`/键前缀版本，旧库自动不命中。
+16. **跨进程槽位只是性能措施，不是安全边界。** `src/slots.ts` 任何错误（目录不可用、文件系统出错、被篡改的槽位文件）都退回“立即返回空释放函数”，不得阻塞推理、不得抛、不得让请求失败或少遮；释放只删内容仍是自己 token 的文件；槽位文件内容只有 `pid token 时间`，不含任何文本。已知并接受：回收竞态可能短暂多占一个槽位；旧版本进程不参与限流。`InferenceSession.create` 的 `extra`（关闭自旋）不得去掉，除非实测证明不生效。
+17. **预扫描范围只影响“提前扫”，不影响遮挡。** `sentTexts`（`src/index.ts`）只决定后台预扫描扫哪些条目；出口 `maskTexts` 总是遮挡请求里的全部文本，没被预扫的内容在出口照常推理（只是更慢）。`loadBranch`、`/pii` 计数、`session_compact` 里的 `noteUsed` 一律用整条分支，不得改用预扫描范围。
 
 ## 6. 改动流程与验证
 
