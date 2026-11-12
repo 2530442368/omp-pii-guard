@@ -285,6 +285,119 @@ describe("目录不可用", () => {
   });
 });
 
+describe("等待上限与伪造的槽位文件", () => {
+  const preset = (n: number, content: (i: number) => string, mtime?: Date) => {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    for (let i = 0; i < n; i++) {
+      const f = path.join(dir, `slot-${i}`);
+      fs.writeFileSync(f, content(i), { mode: 0o600 });
+      if (mtime) fs.utimesSync(f, mtime, mtime);
+    }
+  };
+
+  test("mtime 在远期的伪造槽位（存活 pid）：被当作过期回收，不会一直等", async () => {
+    const future = new Date(Date.now() + 365 * 86_400_000);
+    preset(3, (i) => `${process.pid} forged-${i} ${Date.now()}`, future);
+    const slots = openGlobalSlots({ dir, total: 3, background: 1 })!;
+    const fg = await race(slots.acquire(false), 2000);
+    const bg = await race(slots.acquire(true), 2000);
+    expect(fg).not.toBe("timeout");
+    expect(bg).not.toBe("timeout");
+    const mine = slotFiles().filter((f) => !fs.readFileSync(path.join(dir, f), "utf8").includes("forged"));
+    expect(mine.length).toBe(2); // 前台、后台各回收并占了一个
+    (fg as () => void)();
+    (bg as () => void)();
+  });
+
+  test("时钟小抖动内（未来几秒）不算伪造", async () => {
+    const soon = new Date(Date.now() + 1_000);
+    preset(1, () => `${process.pid} live-token ${Date.now()}`, soon);
+    const msgs: string[] = [];
+    const slots = openGlobalSlots({ dir, total: 1, background: 1, debug: (m) => msgs.push(m), maxWaitMs: { foreground: 300 } })!;
+    const t0 = Date.now();
+    await slots.acquire(false);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(250); // 没被回收，等到了上限
+    expect(fs.readFileSync(path.join(dir, "slot-0"), "utf8")).toContain("live-token");
+  });
+
+  test("槽位被存活持有者占满：前台、后台都在各自的上限内返回空释放函数并记 debug", async () => {
+    preset(2, (i) => `${process.pid} busy-${i} ${Date.now()}`);
+    const msgs: string[] = [];
+    const slots = openGlobalSlots({ dir, total: 2, background: 1, debug: (m) => msgs.push(m), maxWaitMs: { foreground: 300, background: 600 } })!;
+    let t0 = Date.now();
+    const fg = await slots.acquire(false);
+    const fgMs = Date.now() - t0;
+    t0 = Date.now();
+    const bg = await slots.acquire(true);
+    const bgMs = Date.now() - t0;
+    expect(fgMs).toBeGreaterThanOrEqual(250);
+    expect(fgMs).toBeLessThan(2500);
+    expect(bgMs).toBeGreaterThanOrEqual(550);
+    expect(bgMs).toBeLessThan(3000);
+    fg();
+    bg();
+    expect(slotFiles().length).toBe(2); // 空释放函数没删别人的文件
+    for (const f of slotFiles()) expect(fs.readFileSync(path.join(dir, f), "utf8")).toContain("busy-");
+    expect(msgs.length).toBe(2);
+    // 超时不影响之后：槽位空出来就能正常取到
+    fs.unlinkSync(path.join(dir, "slot-0"));
+    const r = await slots.acquire(false);
+    expect(fs.readFileSync(path.join(dir, "slot-0"), "utf8")).not.toContain("busy-");
+    r();
+  });
+
+  test("默认等待上限：前台约 10 s、后台约 60 s（不在测试里等满，只核对未被误改）", async () => {
+    const src = fs.readFileSync(path.join(import.meta.dir, "../src/slots.ts"), "utf8");
+    expect(src).toMatch(/FOREGROUND_MAX_WAIT_MS = 10_000/);
+    expect(src).toMatch(/BACKGROUND_MAX_WAIT_MS = 60_000/);
+  });
+});
+
+describe("目录被运行中替换", () => {
+  /** 把 dir 换成指向 elsewhere 的符号链接；elsewhere 里预置一个“看起来过期、内容为 token 的”slot-0 与无关文件。 */
+  function swap(token: string): string {
+    const elsewhere = path.join(root, "elsewhere");
+    fs.mkdirSync(elsewhere);
+    fs.writeFileSync(path.join(elsewhere, "slot-0"), `999999999 ${token} 1`); // 死 pid：若被当作自家目录会被回收
+    fs.writeFileSync(path.join(elsewhere, "keep.txt"), "keep");
+    fs.renameSync(dir, path.join(root, "moved-away"));
+    fs.symlinkSync(elsewhere, dir);
+    return elsewhere;
+  }
+
+  test("初始化后目录被换成符号链接：不在目录外创建或回收槽位文件，acquire 退回空释放函数", async () => {
+    const msgs: string[] = [];
+    const slots = openGlobalSlots({ dir, total: 2, background: 1, debug: (m) => msgs.push(m) })!;
+    const elsewhere = swap("other-token");
+    const release = await race(slots.acquire(false), 2000);
+    expect(release).not.toBe("timeout");
+    (release as () => void)();
+    expect(fs.readdirSync(elsewhere).sort()).toEqual(["keep.txt", "slot-0"]); // 没有新的 slot-*
+    expect(fs.readFileSync(path.join(elsewhere, "slot-0"), "utf8")).toBe("999999999 other-token 1"); // 没被回收
+    expect(msgs.length).toBe(1);
+  });
+
+  test("持有槽位后目录被换掉：释放不会删目录外的同名文件（即使内容 token 相同）", async () => {
+    const slots = openGlobalSlots({ dir, total: 1, background: 1 })!;
+    const release = await slots.acquire(false);
+    const token = fs.readFileSync(path.join(dir, "slot-0"), "utf8").split(" ")[1]!;
+    const elsewhere = swap(token);
+    release();
+    expect(fs.readFileSync(path.join(elsewhere, "slot-0"), "utf8")).toBe(`999999999 ${token} 1`);
+    expect(fs.existsSync(path.join(elsewhere, "keep.txt"))).toBe(true);
+  });
+
+  test("目录被换成另一个真实目录（inode 不同）同样不认", async () => {
+    const slots = openGlobalSlots({ dir, total: 1, background: 1 })!;
+    fs.renameSync(dir, path.join(root, "moved-away"));
+    fs.mkdirSync(dir, { mode: 0o700 });
+    const release = await race(slots.acquire(false), 2000);
+    expect(release).not.toBe("timeout");
+    (release as () => void)();
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+});
+
 describe("Limiter 接线", () => {
   test("进程内名额 2、跨进程槽位 1：同时在跑的 ≤ 1，且推理期间持有槽位、结束后释放", async () => {
     const limiter = new Limiter(2, openGlobalSlots({ dir, total: 1, background: 1 }));
@@ -329,5 +442,59 @@ describe("Limiter 接线", () => {
   test("不给 global：行为与原来一致", async () => {
     const limiter = new Limiter(1);
     expect(await limiter.run(async () => "ok")).toBe("ok");
+  });
+
+  test("另一个进程长期持有唯一的后台槽位、本进程排着多个后台任务：前台任务立即拿到槽位并完成", async () => {
+    const holder = worker({ SLOTS_TOTAL: "3", SLOTS_BG: "1", WORKER_MODE: "hold", WORKER_BG: "1" });
+    await whenHeld(holder);
+    const limiter = new Limiter(3, openGlobalSlots({ dir, total: 3, background: 1 }));
+    let bgDone = 0;
+    const bgs = Array.from({ length: 5 }, () => limiter.run(async () => void bgDone++, true));
+    await sleep(200); // 后台任务都在等 slot-0
+    expect(bgDone).toBe(0);
+    const t0 = Date.now();
+    const fgs = await race(Promise.all([limiter.run(async () => "a"), limiter.run(async () => "b")]), 3000);
+    expect(fgs).toEqual(["a", "b"]);
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(bgDone).toBe(0); // 后台仍排着
+    holder.child.kill("SIGKILL"); // 槽位回收后后台任务依次完成
+    await race(Promise.all(bgs), 15_000);
+    expect(bgDone).toBe(5);
+    expect(slotFiles()).toEqual([]);
+  }, 30_000);
+
+  test("global 没给 background 份额：后台的进程内名额取 limit 的一半，前台总有名额", async () => {
+    const gate = Promise.withResolvers<void>();
+    const fake = { acquire: async (bg: boolean) => (bg ? gate.promise.then(() => () => {}) : () => {}) }; // 后台一直等，前台不等
+    const limiter = new Limiter(4, fake);
+    let bgDone = 0;
+    const bgs = Array.from({ length: 6 }, () => limiter.run(async () => void bgDone++, true));
+    await sleep(50);
+    expect(await race(limiter.run(async () => "fg"), 1000)).toBe("fg"); // 6 个后台只占 2 个进程内名额
+    expect(await race(limiter.run(async () => "fg2"), 1000)).toBe("fg2");
+    expect(bgDone).toBe(0);
+    gate.resolve();
+    await race(Promise.all(bgs), 5000);
+    expect(bgDone).toBe(6);
+  });
+
+  test("global.background 给了份额：后台进程内名额等于它", async () => {
+    const gate = Promise.withResolvers<void>();
+    let waitingForGlobal = 0;
+    const fake = {
+      background: 3,
+      acquire: async (bg: boolean) => {
+        if (!bg) return () => {};
+        waitingForGlobal++;
+        await gate.promise;
+        return () => {};
+      },
+    };
+    const limiter = new Limiter(5, fake);
+    const bgs = Array.from({ length: 8 }, () => limiter.run(async () => {}, true));
+    await sleep(50);
+    expect(waitingForGlobal).toBe(3);
+    gate.resolve();
+    await race(Promise.all(bgs), 5000);
   });
 });

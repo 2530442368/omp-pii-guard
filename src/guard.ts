@@ -64,19 +64,41 @@ export async function verifyModel(dir: string): Promise<void> {
 /**
  * 一个限制并发的闸门；前台（出口请求）的等待排在后台（预扫描）前面。
  * 给了 global 时：拿到进程内名额后再取跨进程槽位（见 src/slots.ts），推理完先放跨进程槽位再交接进程内名额。
+ *
+ * 后台任务的进程内名额另有上限 bgCap（= global.background，没给时取 limit 的一半，至少 1）：
+ * 后台任务拿到进程内名额后可能要等别的进程释放后台槽位，若让它们占满进程内名额，本进程的前台任务就算有空闲的
+ * 前台槽位也排不上。上限之内，limit > bgCap 时总有进程内名额留给前台。
+ * 无死锁：等待跨进程槽位的任务只在等“正在推理的任务”（不再等任何东西）放槽位，或等槽位过期回收/等待上限；
+ * 进程内名额的等待者只在等持有名额的任务，而持有者要么在推理、要么在等跨进程槽位，不存在环。
  */
 export class Limiter {
   private active = 0;
+  private bgActive = 0;
+  private readonly bgCap: number;
   private readonly waiting: (() => void)[] = [];
   private readonly waitingBackground: (() => void)[] = [];
   constructor(
     readonly limit: number,
     private readonly global?: GlobalSlots,
-  ) {}
+  ) {
+    this.bgCap = global ? Math.min(limit, Math.max(1, global.background ?? Math.floor(limit / 2))) : limit;
+  }
 
   async run<T>(fn: () => Promise<T>, background = false): Promise<T> {
-    if (this.active < this.limit) this.active++;
-    else await new Promise<void>((resolve) => (background ? this.waitingBackground : this.waiting).push(resolve)); // 槽位由释放者直接交接
+    if (this.active < this.limit && (!background || this.bgActive < this.bgCap)) {
+      this.active++;
+      if (background) this.bgActive++;
+    } else {
+      // 名额由释放者直接交接（交接时一并记 bgActive）
+      await new Promise<void>((resolve) =>
+        background
+          ? this.waitingBackground.push(() => {
+              this.bgActive++;
+              resolve();
+            })
+          : this.waiting.push(resolve),
+      );
+    }
     try {
       let release: (() => void) | undefined;
       try {
@@ -88,7 +110,8 @@ export class Limiter {
         release?.();
       }
     } finally {
-      const next = this.waiting.shift() ?? this.waitingBackground.shift();
+      if (background) this.bgActive--;
+      const next = this.waiting.shift() ?? (this.bgActive < this.bgCap ? this.waitingBackground.shift() : undefined);
       if (next) next();
       else this.active--;
     }
