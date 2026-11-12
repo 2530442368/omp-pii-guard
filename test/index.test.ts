@@ -792,14 +792,14 @@ describe("预扫描", () => {
     expect(payload.messages[0]!.content).toContain("{{PHONE_");
   });
 
-  test("session_start 扫描整条分支（消息、工具参数、压缩摘要）", async () => {
+  test("session_start 扫描会发出的分支部分（消息、工具参数、压缩摘要；压缩保留从第一条起 → 全部）", async () => {
     const { rec } = fresh();
     const t = makePi();
     piiGuard(t.pi);
     const branch = [
-      { type: "message", message: { role: "user", content: [{ type: "text", text: "第一条 张伟" }] } },
-      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "1", name: "write", arguments: { content: "参数 13812345678" } }] } },
-      { type: "compaction", summary: "摘要 zhangwei@acme-corp.cn" },
+      { type: "message", id: "m1", message: { role: "user", content: [{ type: "text", text: "第一条 张伟" }] } },
+      { type: "message", id: "m2", message: { role: "assistant", content: [{ type: "toolCall", id: "1", name: "write", arguments: { content: "参数 13812345678" } }] } },
+      { type: "compaction", id: "c1", firstKeptEntryId: "m1", summary: "摘要 zhangwei@acme-corp.cn" },
     ];
     const { ctx } = makeCtx({ branch });
     await t.emit("session_start", {}, ctx);

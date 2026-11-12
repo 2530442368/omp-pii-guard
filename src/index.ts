@@ -233,6 +233,31 @@ function branchTexts(entries: readonly any[]): TextItem[] {
   return out;
 }
 
+/**
+ * 预扫描的范围：分支上“会发给模型”的部分（对照 omp 的 buildSessionContext：最后一个 compaction 的摘要，加上
+ * 从它的 firstKeptEntryId 起到分支末尾的条目；更早的 compaction 条目本身不进上下文）。没有 compaction 时与 branchTexts 相同。
+ * firstKeptEntryId 缺失、不在分支上、或不在该 compaction 之前时，保留部分从该 compaction 之后算起。
+ * 范围外的文本没有被预扫描也不会漏遮：真要发出去时出口照常推理。
+ * 只用于预扫描；映射恢复与计数（loadBranch）、压缩补写（session_compact）仍用整条分支。
+ */
+function sentTexts(entries: readonly any[]): TextItem[] {
+  let c = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i]?.type === "compaction") {
+      c = i;
+      break;
+    }
+  }
+  if (c < 0) return branchTexts(entries);
+  const id = entries[c].firstKeptEntryId;
+  let start = c + 1;
+  if (typeof id === "string") {
+    const at = entries.findIndex((e) => e?.id === id);
+    if (at >= 0 && at < c) start = at;
+  }
+  return [...branchTexts([entries[c]]), ...branchTexts(entries.slice(start).filter((e) => e?.type !== "compaction"))];
+}
+
 // ---- 扩展 ------------------------------------------------------------------------------------
 
 export default function piiGuard(pi: any): void {
@@ -443,7 +468,7 @@ export default function piiGuard(pi: any): void {
         if (!v || !VERIFIED_VERSION.test(v)) notify(rt, `网络层遮挡未在此 omp 版本验证（${v ?? "版本未知"}，已验证 18.18.x）`, "warning");
       }
     }
-    scan(ctx, branchTexts(entries));
+    scan(ctx, sentTexts(entries));
   };
 
   // ---- /pii ----
