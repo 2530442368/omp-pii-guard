@@ -40,6 +40,8 @@ export interface FindCacheOptions {
   /** 条数上限，默认 200 000。 */
   maxEntries?: number;
   debug?: (m: string) => void;
+  /** 初始化遇忙时异步重试的总预算（毫秒，默认 10 000）；测试用。 */
+  initBudgetMs?: number;
 }
 
 const KEY_PREFIX = "pii-guard/find-cache/v1\0";
@@ -51,6 +53,9 @@ const FLUSH_MS = 3000;
 const MAX_PENDING = 5000;
 const CHUNK = 400;
 const MAX_FAILURES = 5;
+/** 单次同步 SQLite 调用的忙等上限：主线程被阻塞的时间以它为界（出口有 25 s 截止定时器，界面也在这个线程上）。 */
+const BUSY_MS = 50;
+const INIT_BUDGET_MS = 10_000;
 
 const VALID_LABELS: ReadonlySet<string> = new Set(LABELS.filter((l) => l !== "O").map((l) => l.slice(2)));
 
@@ -94,14 +99,49 @@ export function parseFinds(json: unknown, len: number): RawFind[] | undefined {
 }
 
 class RebuildNeeded extends Error {}
+/** 缓存目录或侧文件不安全（被换成符号链接、属主不对、权限收不紧）：本进程禁用缓存，不删任何东西。 */
+class Unsafe extends Error {}
 
 const msgOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const codeOf = (e: unknown): string => (e instanceof Error && "code" in e ? String(e.code) : "");
 
 function isCorrupt(e: unknown): boolean {
   if (e instanceof RebuildNeeded) return true;
-  const code = e instanceof Error && "code" in e ? String(e.code) : "";
+  const code = codeOf(e);
   if (code === "SQLITE_NOTADB" || code === "SQLITE_CORRUPT" || code.startsWith("SQLITE_CORRUPT_")) return true;
   return /not a database|malformed/i.test(msgOf(e));
+}
+
+/** 忙/锁（别的进程正在初始化或写入）。 */
+function isBusy(e: unknown): boolean {
+  const code = codeOf(e);
+  return code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" || /database is locked|database is busy/i.test(msgOf(e));
+}
+
+/** 目录的身份（打开时记下），之后每次删库重建、重新打开前用 lstat 复核。 */
+interface DirId {
+  dir: string;
+  dev: number;
+  ino: number;
+}
+
+function dirIdOf(dir: string): DirId {
+  const st = fs.lstatSync(dir);
+  return { dir, dev: st.dev, ino: st.ino };
+}
+
+/** 目录必须仍是打开时记下的那个真实目录、属主是当前用户；否则抛 Unsafe（调用方禁用缓存，不删任何文件）。 */
+function verifyDir(id: DirId): void {
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(id.dir);
+  } catch (e) {
+    throw new Unsafe(`缓存目录无法核对：${msgOf(e)}`);
+  }
+  if (!st.isDirectory()) throw new Unsafe("缓存目录被换成了符号链接或其他类型");
+  if (st.dev !== id.dev || st.ino !== id.ino) throw new Unsafe("缓存目录已不是打开时的那个目录");
+  const uid = process.getuid?.();
+  if (uid !== undefined && st.uid !== uid) throw new Unsafe("缓存目录的属主不是当前用户");
 }
 
 function removeFiles(file: string): void {
@@ -114,54 +154,72 @@ function removeFiles(file: string): void {
   }
 }
 
-function chmodQuiet(f: string): void {
+/**
+ * 保证文件是自己的、权限 0600 的普通文件，改权限不跟随符号链接（O_NOFOLLOW 打开后 fchmod，并核对 fd 与 lstat 是同一个 inode）。
+ * 符号链接：只删链接本身（`strict` 时删完仍抛 Unsafe：它在数据库已打开之后才出现，说明有人在抢）；
+ * 其他非普通文件抛 Unsafe。文件不存在是正常的（-wal/-shm 只在需要时才有）。
+ */
+function secureFile(p: string, strict: boolean): void {
+  let st: fs.Stats;
   try {
-    fs.chmodSync(f, 0o600);
-  } catch {}
+    st = fs.lstatSync(p);
+  } catch (e) {
+    if (codeOf(e) === "ENOENT") return;
+    throw new Unsafe(`无法检查 ${path.basename(p)}：${msgOf(e)}`);
+  }
+  if (st.isSymbolicLink()) {
+    fs.unlinkSync(p);
+    if (strict) throw new Unsafe(`${path.basename(p)} 被换成了符号链接（已删除链接本身）`);
+    return;
+  }
+  if (!st.isFile()) throw new Unsafe(`${path.basename(p)} 不是普通文件`);
+  const uid = process.getuid?.();
+  if (uid !== undefined && st.uid !== uid) throw new Unsafe(`${path.basename(p)} 的属主不是当前用户`);
+  if ((st.mode & 0o777) === 0o600) return;
+  try {
+    const fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const s2 = fs.fstatSync(fd);
+      if (!s2.isFile() || s2.dev !== st.dev || s2.ino !== st.ino) throw new Unsafe(`${path.basename(p)} 在检查期间被替换`);
+      fs.fchmodSync(fd, 0o600);
+      if ((fs.fstatSync(fd).mode & 0o777) !== 0o600) throw new Unsafe(`${path.basename(p)} 权限无法收紧到 0600`);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (e) {
+    throw e instanceof Unsafe ? e : new Unsafe(`${path.basename(p)} 权限无法收紧到 0600：${msgOf(e)}`);
+  }
 }
 
-/** 忙/锁（别的进程正在初始化或写入）。 */
-function isBusy(e: unknown): boolean {
-  const code = e instanceof Error && "code" in e ? String(e.code) : "";
-  return code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" || /database is locked|database is busy/i.test(msgOf(e));
-}
+const SIDES = ["-wal", "-shm"] as const;
 
-const sleepSync = (ms: number): void => void Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-/** 初始化遇到忙/锁时的重试：很多进程同时首次创建数据库（Tern 一次恢复几十个会话）时，切换到 WAL 的那一步不走 busy_timeout，会直接报 locked。 */
-const INIT_RETRIES = 40;
-
-/** 打开（必要时创建）数据库并确认可用；损坏类问题抛 isCorrupt 为真的错误；忙/锁时带抖动重试。 */
-function openDb(file: string): Database {
+/**
+ * 打开（必要时创建）数据库并确认可用；同步、单次阻塞有界（busy_timeout 很小）。
+ * 损坏类问题抛 isCorrupt 为真的错误；忙/锁抛 isBusy 为真的错误（调用方异步退避重试）；不安全抛 Unsafe。
+ */
+function openDb(file: string, dir: DirId): Database {
+  verifyDir(dir);
+  // 打开前：数据库及侧文件里的符号链接只删链接本身（SQLite 会跟随链接读写）；其余检查与收紧权限。
   let st: fs.Stats | undefined;
   try {
     st = fs.lstatSync(file);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    if (codeOf(e) !== "ENOENT") throw e;
   }
   if (st) {
     if (!st.isFile()) throw new RebuildNeeded("缓存文件不是普通文件");
-    if ((st.mode & 0o777) !== 0o600) fs.chmodSync(file, 0o600);
+    secureFile(file, false);
   } else {
     try {
       fs.writeFileSync(file, "", { flag: "wx", mode: 0o600 }); // 先以 0600 建好，-wal/-shm 继承它的权限
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      if (codeOf(e) !== "EEXIST") throw e;
     }
   }
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return initDb(file);
-    } catch (e) {
-      if (!isBusy(e) || attempt >= INIT_RETRIES) throw e;
-      sleepSync(10 + Math.random() * 60);
-    }
-  }
-}
-
-function initDb(file: string): Database {
+  for (const s of [...SIDES, "-journal"]) secureFile(file + s, false);
   const db = new Database(file, { create: true, readwrite: true });
   try {
-    db.exec("PRAGMA busy_timeout=2000");
+    db.exec(`PRAGMA busy_timeout=${BUSY_MS}`);
     db.exec("PRAGMA journal_mode=WAL");
     db.exec("PRAGMA synchronous=NORMAL");
     const ver = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
@@ -173,8 +231,8 @@ function initDb(file: string): Database {
       throw new RebuildNeeded("缓存版本不符");
     }
     db.prepare("SELECT h FROM finds LIMIT 1").all(); // 表结构不对或页损坏在这里暴露
-    chmodQuiet(`${file}-wal`);
-    chmodQuiet(`${file}-shm`);
+    secureFile(file, true);
+    for (const s of SIDES) secureFile(file + s, true);
     return db;
   } catch (e) {
     try {
@@ -186,27 +244,77 @@ function initDb(file: string): Database {
 
 class SqliteFindCache implements FindCache {
   private db: Database | undefined;
+  /** 初始化中（第一次遇忙、等异步重试）：getMany 一律未命中，put 暂存。 */
+  private initializing = false;
+  private disabled = false;
+  private initTimer: ReturnType<typeof setTimeout> | undefined;
+  private initDeadline = 0;
+  private initTries = 0;
   private readonly pending = new Map<string, { h: Buffer; v: string }>();
   private readonly touched = new Map<string, Buffer>();
   private timer: ReturnType<typeof setTimeout> | undefined;
+  /** flush 失败后，put 触发的自动 flush 在此时刻之前不再尝试（显式 flush/close 照常尝试一次，各阻塞 ≤ busy_timeout）。 */
+  private retryAt = 0;
   private key: Buffer | undefined;
   private count: number | undefined;
+  /** 上次写事务里读到的 PRAGMA data_version：变了说明别的连接提交过，count 作废。 */
+  private dataVersion: number | undefined;
   private rebuilt = false;
   private failures = 0;
   private readonly max: number;
   private readonly debug: (m: string) => void;
+  private readonly initBudget: number;
   private readonly onExit = (): void => this.close();
 
   constructor(
     private readonly o: FindCacheOptions,
-    db: Database,
-    rebuilt: boolean,
+    private readonly dir: DirId,
   ) {
-    this.db = db;
-    this.rebuilt = rebuilt;
     this.max = Math.max(1, Math.floor(o.maxEntries ?? DEFAULT_MAX));
     this.debug = o.debug ?? (() => {});
+    this.initBudget = o.initBudgetMs ?? INIT_BUDGET_MS;
     process.on("exit", this.onExit);
+  }
+
+  /** 第一次同步尝试；遇忙则转入异步重试。返回缓存是否还可用（false = 已禁用）。 */
+  begin(): boolean {
+    this.initDeadline = Date.now() + this.initBudget;
+    this.attemptInit();
+    return !this.disabled;
+  }
+
+  private attemptInit(): void {
+    this.initTimer = undefined;
+    if (this.disabled) return;
+    this.initTries++;
+    try {
+      this.db = openDb(this.o.file, this.dir);
+    } catch (e) {
+      if (isBusy(e)) {
+        const left = this.initDeadline - Date.now();
+        if (left <= 0) return this.disable(`初始化 ${Math.round(this.initBudget / 1000)} s 内一直遇忙/锁`);
+        this.initializing = true;
+        const wait = Math.min(left, Math.min(1000, 50 * 2 ** Math.min(this.initTries, 5)) * (0.5 + Math.random()));
+        this.debug(`pii-guard 识别缓存初始化遇忙，${Math.round(wait)} ms 后重试`);
+        this.initTimer = setTimeout(() => this.attemptInit(), wait);
+        this.initTimer.unref();
+        return;
+      }
+      if (isCorrupt(e) && !this.rebuilt) {
+        this.debug(`pii-guard 识别缓存损坏，删除重建：${msgOf(e)}`);
+        this.rebuilt = true;
+        try {
+          verifyDir(this.dir);
+          removeFiles(this.o.file);
+        } catch (e2) {
+          return this.disable(`重建失败：${msgOf(e2)}`);
+        }
+        return this.attemptInit();
+      }
+      return this.disable(isCorrupt(e) ? `损坏且已重建过一次：${msgOf(e)}` : `打不开：${msgOf(e)}`);
+    }
+    this.initializing = false;
+    if (this.pending.size > 0 || this.touched.size > 0) this.schedule();
   }
 
   private hash(text: string): Buffer {
@@ -244,7 +352,7 @@ class SqliteFindCache implements FindCache {
           const f = parseFinds(r.v, e.text.length);
           if (!f) continue; // 篡改/损坏的行：当作未命中，推理后会被覆盖
           out.set(e.sha, f);
-          if (r.day !== day) this.touched.set(hex, e.h);
+          if (r.day !== day) this.stageTouch(hex, e.h);
         }
       }
       if (this.touched.size > 0) this.schedule();
@@ -255,14 +363,22 @@ class SqliteFindCache implements FindCache {
     return out;
   }
 
+  private stageTouch(hex: string, h: Buffer): void {
+    this.touched.set(hex, h);
+    capOldest(this.touched);
+  }
+
   put(text: string, finds: readonly RawFind[]): void {
-    if (!this.db) return;
+    if (this.disabled) return;
     try {
       for (const f of finds) if (!validFind(f, text.length)) return; // 读出时也会被拒，不必存
       const v = JSON.stringify(finds.map((f) => [f.start, f.end, f.label, f.score]));
       const h = this.hash(text);
-      this.pending.set(h.toString("hex"), { h, v });
-      if (this.pending.size >= BATCH) this.flush();
+      const hex = h.toString("hex");
+      this.pending.delete(hex);
+      this.pending.set(hex, { h, v });
+      capOldest(this.pending);
+      if (this.db && this.pending.size >= BATCH && Date.now() >= this.retryAt) this.flush();
       else this.schedule();
     } catch (e) {
       this.fail(e);
@@ -272,11 +388,12 @@ class SqliteFindCache implements FindCache {
   flush(): void {
     clearTimeout(this.timer);
     this.timer = undefined;
-    if (!this.db) {
+    if (this.disabled) {
       this.pending.clear();
       this.touched.clear();
       return;
     }
+    if (!this.db) return; // 初始化中：暂存的等初始化完成后再写
     if (this.pending.size === 0 && this.touched.size === 0) return;
     const db = this.db;
     const rows = [...this.pending.values()];
@@ -300,49 +417,46 @@ class SqliteFindCache implements FindCache {
       this.pending.clear();
       this.touched.clear();
       this.failures = 0;
+      this.retryAt = 0;
+      for (const s of SIDES) secureFile(this.o.file + s, true); // -wal/-shm 此时才可能新建：核对不是链接、权限 0600
     } catch (e) {
       this.count = undefined;
-      if (this.pending.size > MAX_PENDING) this.pending.clear();
-      if (this.touched.size > MAX_PENDING) this.touched.clear();
+      this.retryAt = Date.now() + FLUSH_MS;
       this.fail(e);
-      if (this.db && (this.pending.size > 0 || this.touched.size > 0)) this.schedule(); // 忙/锁：稍后重试
+      if (!this.disabled && this.db && (this.pending.size > 0 || this.touched.size > 0)) this.schedule(); // 忙/锁：保留这批，稍后重试
     }
   }
 
-  /** 在事务内：超过上限时按最近使用日淘汰到 90%。count 是上界，超过上限才精确重数。 */
+  /**
+   * 在写事务内（已持有写锁，别的连接此刻不能提交）：超过上限时按最近使用日淘汰到 90%。
+   * count 只在“自上次写事务以来没有别的连接提交过”（data_version 没变）时累加，否则重数；
+   * 重数是对 WITHOUT ROWID 表的一次扫描，只发生在别的进程写过之后，次数受 flush 频率（≥3 s 一次或攒够 200 条）限制。
+   */
   private evict(db: Database, added: number): void {
     const exact = (): number => (db.prepare("SELECT count(*) AS c FROM finds").get() as { c: number }).c;
-    let n = this.count === undefined ? exact() : this.count + added;
+    const dv = (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
+    let n = this.count !== undefined && dv === this.dataVersion ? this.count + added : exact();
+    this.dataVersion = dv;
     if (n > this.max) {
       n = exact();
       if (n > this.max) {
         const drop = n - Math.floor(this.max * 0.9);
-        db.prepare("DELETE FROM finds WHERE h IN (SELECT h FROM finds ORDER BY day ASC LIMIT ?)").run(drop);
-        n = exact();
+        n -= db.prepare("DELETE FROM finds WHERE h IN (SELECT h FROM finds ORDER BY day ASC LIMIT ?)").run(drop).changes;
       }
     }
     this.count = n;
   }
 
   close(): void {
-    if (!this.db) return;
+    if (this.disabled) return;
     try {
       this.flush();
     } catch {}
-    clearTimeout(this.timer);
-    this.timer = undefined;
-    process.off("exit", this.onExit);
-    const db = this.db;
-    this.db = undefined;
-    this.pending.clear();
-    this.touched.clear();
-    try {
-      db.close();
-    } catch {}
+    this.disable();
   }
 
   private schedule(): void {
-    if (this.timer) return;
+    if (this.timer || this.disabled) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
       this.flush();
@@ -354,36 +468,45 @@ class SqliteFindCache implements FindCache {
   private fail(e: unknown): void {
     try {
       this.debug(`pii-guard 识别缓存出错（当作未命中）：${msgOf(e)}`);
-      if (isCorrupt(e)) {
-        this.recover();
-        return;
+      if (e instanceof Unsafe) return this.disable(msgOf(e));
+      try {
+        if (this.db) for (const s of SIDES) secureFile(this.o.file + s, true); // 出错时顺带核对侧文件（被换成链接时 SQLite 自己也会报 I/O 错误）
+      } catch (e2) {
+        return this.disable(msgOf(e2));
       }
+      if (isCorrupt(e)) return this.recover();
       if (++this.failures >= MAX_FAILURES) this.disable("连续出错");
     } catch {}
   }
 
   private recover(): void {
-    const old = this.db;
-    if (!old) return;
     try {
-      old.close();
+      this.db?.close();
     } catch {}
     this.db = undefined;
     this.count = undefined;
+    this.dataVersion = undefined;
     if (this.rebuilt) return this.disable("损坏且已重建过一次");
     this.rebuilt = true;
     try {
+      verifyDir(this.dir);
       removeFiles(this.o.file);
-      this.db = openDb(this.o.file);
     } catch (e) {
-      this.disable(`重建失败：${msgOf(e)}`);
+      return this.disable(`重建失败：${msgOf(e)}`);
     }
+    this.initDeadline = Date.now() + this.initBudget;
+    this.attemptInit();
   }
 
-  private disable(why: string): void {
-    this.debug(`pii-guard 识别缓存本进程禁用：${why}`);
+  /** 停用并释放（幂等）。why 给出时记一条 debug。 */
+  private disable(why?: string): void {
+    if (why) this.debug(`pii-guard 识别缓存本进程禁用：${why}`);
+    this.disabled = true;
+    this.initializing = false;
     clearTimeout(this.timer);
     this.timer = undefined;
+    clearTimeout(this.initTimer);
+    this.initTimer = undefined;
     process.off("exit", this.onExit);
     try {
       this.db?.close();
@@ -394,33 +517,36 @@ class SqliteFindCache implements FindCache {
   }
 }
 
-/** 打开持久识别缓存；任何原因打不开（含目录不安全）返回 undefined，调用方照常推理。不抛。 */
+/** 超过暂存上限时丢最旧的（Map 按插入顺序）。 */
+function capOldest(m: Map<string, unknown>): void {
+  while (m.size > MAX_PENDING) {
+    const first = m.keys().next();
+    if (first.done) break;
+    m.delete(first.value);
+  }
+}
+
+/**
+ * 打开持久识别缓存；任何原因打不开（含目录不安全）返回 undefined，调用方照常推理。不抛。
+ * 第一次尝试是同步的、单次阻塞 ≤ 约 busy_timeout；遇到忙/锁（别的进程正在初始化）时先返回缓存对象，
+ * 初始化在后台用定时器退避重试（总预算约 10 s，超了本进程禁用）：此前 getMany 一律未命中、put 暂存。
+ */
 export function openFindCache(opts: FindCacheOptions): FindCache | undefined {
   const debug = opts.debug ?? (() => {});
+  let dir: DirId;
   try {
-    ensureOwnDir(path.dirname(opts.file));
+    const d = path.dirname(opts.file);
+    ensureOwnDir(d);
+    dir = dirIdOf(d);
   } catch (e) {
     debug(`pii-guard 识别缓存目录不可用，已停用：${msgOf(e)}`);
     return undefined;
   }
-  let rebuilt = false;
-  let db: Database | undefined;
   try {
-    db = openDb(opts.file);
+    const cache = new SqliteFindCache(opts, dir);
+    return cache.begin() ? cache : undefined;
   } catch (e) {
-    if (!isCorrupt(e)) {
-      debug(`pii-guard 识别缓存打不开，已停用：${msgOf(e)}`);
-      return undefined;
-    }
-    debug(`pii-guard 识别缓存损坏，删除重建：${msgOf(e)}`);
-    try {
-      removeFiles(opts.file);
-      rebuilt = true;
-      db = openDb(opts.file);
-    } catch (e2) {
-      debug(`pii-guard 识别缓存重建失败，已停用：${msgOf(e2)}`);
-      return undefined;
-    }
+    debug(`pii-guard 识别缓存打不开，已停用：${msgOf(e)}`);
+    return undefined;
   }
-  return new SqliteFindCache(opts, db, rebuilt);
 }

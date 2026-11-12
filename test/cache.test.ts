@@ -475,3 +475,271 @@ describe("Masker 接入持久缓存", () => {
     expect(m.rec.calls.length).toBe(1);
   });
 });
+
+// 单次同步调用的耗时上限：忙等上限是 50 ms，这里放宽到 400 ms（机器负载高时也不该接近旧实现的数十秒）。
+const CALL_MAX_MS = 400;
+
+/** 计时：返回 fn 的结果，并把耗时记进 times。 */
+function timed<T>(times: number[], fn: () => T): T {
+  const t0 = performance.now();
+  try {
+    return fn();
+  } finally {
+    times.push(performance.now() - t0);
+  }
+}
+
+/** 轮询等缓存初始化完成：put 一条探针，getMany 能读到（db 已就绪时才会查）即就绪。 */
+async function untilReady(c: FindCache, ms = 8000): Promise<void> {
+  const probe = "就绪探针";
+  for (const end = Date.now() + ms; Date.now() < end; ) {
+    c.put(probe, []);
+    if (c.getMany(one(probe)).has(sha(probe))) return;
+    await Bun.sleep(20);
+  }
+  throw new Error("缓存没有在时限内初始化完成");
+}
+
+describe("持久识别缓存：别的连接长期持有写锁时主线程不被卡住", () => {
+  test("初始化遇忙（回滚日志模式下的 EXCLUSIVE 锁）：openFindCache/getMany/put/flush 都很快，锁释放后完成初始化并写入", async () => {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const other = new Database(file);
+    other.exec("CREATE TABLE x(a)");
+    other.exec("BEGIN EXCLUSIVE");
+    const times: number[] = [];
+    const msgs: string[] = [];
+    const c = timed(times, () => openFindCache({ file, key: () => KEY, revision: "r1", debug: (m) => msgs.push(m) }));
+    expect(c).toBeDefined();
+    opened.push(c!);
+    const t = "手机 13800000000 请回电";
+    for (let i = 0; i < 300; i++) {
+      timed(times, () => c!.put(`${t}${i}`, [F(3, 14)])); // 初始化中：暂存
+      if (i % 50 === 0) {
+        expect(timed(times, () => c!.getMany(one(t))).size).toBe(0);
+        timed(times, () => c!.flush());
+      }
+    }
+    expect(Math.max(...times)).toBeLessThan(CALL_MAX_MS);
+    expect(msgs.some((m) => m.includes("初始化遇忙"))).toBe(true);
+    other.exec("ROLLBACK");
+    other.close();
+    await untilReady(c!);
+    timed(times, () => c!.flush());
+    expect(Math.max(...times)).toBeLessThan(CALL_MAX_MS);
+    // 初始化期间暂存的条目在初始化完成后写入
+    const got = open().getMany(new Map(Array.from({ length: 300 }, (_, i) => [`k${i}`, `${t}${i}`])));
+    expect(got.size).toBe(300);
+  });
+
+  test("初始化遇忙（WAL 写锁，库里还没有表）：同样不卡，释放后建表并写入", async () => {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const other = new Database(file);
+    other.exec("PRAGMA journal_mode=WAL");
+    other.exec("BEGIN IMMEDIATE");
+    other.exec("CREATE TABLE x(a)"); // 持有写锁
+    const times: number[] = [];
+    const c = timed(times, () => openFindCache({ file, key: () => KEY, revision: "r1" }));
+    expect(c).toBeDefined();
+    opened.push(c!);
+    timed(times, () => c!.put("手机 13800000000", [F(3, 14)]));
+    timed(times, () => c!.getMany(one("手机 13800000000")));
+    expect(Math.max(...times)).toBeLessThan(CALL_MAX_MS);
+    other.exec("COMMIT");
+    other.close();
+    await untilReady(c!);
+    c!.flush();
+    expect(open().getMany(one("手机 13800000000")).size).toBe(1);
+  });
+
+  test("初始化一直遇忙超过预算：本进程禁用缓存，不抛，不留定时器", async () => {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const other = new Database(file);
+    other.exec("CREATE TABLE x(a)");
+    other.exec("BEGIN EXCLUSIVE");
+    const msgs: string[] = [];
+    const c = openFindCache({ file, key: () => KEY, revision: "r1", initBudgetMs: 400, debug: (m) => msgs.push(m) });
+    expect(c).toBeDefined();
+    opened.push(c!);
+    c!.put("手机 13800000000", [F(3, 14)]);
+    await Bun.sleep(1200);
+    expect(msgs.some((m) => m.includes("本进程禁用"))).toBe(true);
+    other.exec("ROLLBACK");
+    other.close();
+    await Bun.sleep(300); // 已禁用：锁放开后也不会再初始化
+    expect(() => c!.put("别的文本", [F(0, 2)])).not.toThrow();
+    expect(c!.getMany(one("手机 13800000000")).size).toBe(0);
+    c!.flush();
+    expect(open().getMany(one("手机 13800000000")).size).toBe(0);
+  });
+
+  test("写锁被长期持有：put 与 flush 每次都很快，这批保留，释放后写入；暂存超过上限时丢最旧的", async () => {
+    open().close(); // 先建好库（已是 WAL、有表）：初始化只读，不受写锁影响
+    const other = new Database(file);
+    other.exec("BEGIN IMMEDIATE");
+    other.exec("INSERT INTO finds VALUES(x'00', '[]', 1)"); // 持有写锁
+    const times: number[] = [];
+    const c = timed(times, () => open());
+    const texts = Array.from({ length: 5300 }, (_, i) => `暂存文本 ${i} 号码`);
+    for (const t of texts) timed(times, () => c.put(t, [F(0, 2)]));
+    timed(times, () => c.flush());
+    timed(times, () => c.flush());
+    expect(timed(times, () => c.getMany(one(texts[5299]!))).size).toBe(1);
+    expect(Math.max(...times)).toBeLessThan(CALL_MAX_MS);
+    other.exec("ROLLBACK");
+    other.close();
+    c.flush(); // 锁已放开：保留的这批写入
+    const got = open().getMany(new Map(texts.map((t) => [sha(t), t])));
+    expect(got.size).toBe(5000); // 上限 5000，丢的是最旧的
+    expect(got.has(sha(texts[0]!))).toBe(false);
+    expect(got.has(sha(texts[299]!))).toBe(false);
+    expect(got.has(sha(texts[300]!))).toBe(true);
+    expect(got.has(sha(texts[5299]!))).toBe(true);
+  });
+
+  test("写锁长期被持有、flush 连续失败：按规则禁用，不抛", async () => {
+    open().close();
+    const other = new Database(file);
+    other.exec("BEGIN IMMEDIATE");
+    other.exec("INSERT INTO finds VALUES(x'00', '[]', 1)");
+    const msgs: string[] = [];
+    const c = open({ debug: (m) => msgs.push(m) });
+    c.put("手机 13800000000", [F(3, 14)]);
+    for (let i = 0; i < 6; i++) c.flush();
+    expect(msgs.some((m) => m.includes("本进程禁用"))).toBe(true);
+    expect(() => c.put("别的文本", [F(0, 2)])).not.toThrow();
+    other.exec("ROLLBACK");
+    other.close();
+  });
+});
+
+describe("持久识别缓存：多连接下的容量上限", () => {
+  test("A、B 交替写：每次写完总行数都不超过 maxEntries", () => {
+    const a = open({ maxEntries: 20 });
+    const b = open({ maxEntries: 20 });
+    const db = rawDb();
+    const rows = (): number => (db.prepare("SELECT count(*) AS c FROM finds").get() as { c: number }).c;
+    for (let round = 0; round < 12; round++) {
+      for (const [name, c] of [["a", a], ["b", b]] as const) {
+        for (let i = 0; i < 6; i++) c.put(`${name} 文本 ${round}-${i} 号码`, [F(0, 2)]);
+        c.flush();
+        expect(rows(), `${name} 第 ${round} 轮`).toBeLessThanOrEqual(20);
+      }
+    }
+    expect(rows()).toBeGreaterThan(0);
+    db.close();
+  });
+});
+
+describe("持久识别缓存：侧文件与目录身份", () => {
+  const outside = (): string => path.join(root, "outside");
+  const side = (s: string): string => `${file}${s}`;
+  const snapshot = (p: string): string => `${fs.readFileSync(p, "utf8")}|${(fs.statSync(p).mode & 0o777).toString(8)}`;
+
+  test("-wal/-shm 预置为指向目录外文件的符号链接：删链接本身，目录外文件的权限与内容不变", () => {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const targets: string[] = [];
+    for (const s of ["-wal", "-shm", "-journal"]) {
+      const target = `${outside()}${s}`;
+      fs.writeFileSync(target, "目录外的文件", { mode: 0o644 });
+      fs.chmodSync(target, 0o644);
+      fs.symlinkSync(target, side(s));
+      targets.push(target);
+    }
+    const before = targets.map(snapshot);
+    const a = open();
+    a.put("手机 13800000000", [F(3, 14)]);
+    a.flush();
+    expect(open().getMany(one("手机 13800000000")).size).toBe(1);
+    expect(targets.map(snapshot)).toEqual(before);
+    for (const s of ["-wal", "-shm"]) if (fs.existsSync(side(s))) expect(fs.lstatSync(side(s)).isSymbolicLink()).toBe(false);
+  });
+
+  test("-wal 是目录：不启用缓存，不抛，不删它", () => {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(side("-wal"));
+    fs.writeFileSync(path.join(side("-wal"), "keep"), "留着");
+    expect(openFindCache({ file, key: () => KEY, revision: "r1" })).toBeUndefined();
+    expect(fs.readFileSync(path.join(side("-wal"), "keep"), "utf8")).toBe("留着");
+  });
+
+  test("放宽过权限的 -wal/-shm 收紧到 0600；权限修改不跟随符号链接", () => {
+    const a = open();
+    a.put("手机 13800000000", [F(3, 14)]);
+    a.flush();
+    for (const s of ["-wal", "-shm"]) fs.chmodSync(side(s), 0o666);
+    const b = open();
+    b.put("别的文本 号码", [F(0, 2)]);
+    b.flush();
+    for (const s of ["-wal", "-shm"]) expect(fs.statSync(side(s)).mode & 0o777).toBe(0o600);
+  });
+
+  test("运行中 -wal 被换成符号链接：下一次 flush 后禁用，目录外文件不动", () => {
+    const a = open();
+    a.put("手机 13800000000", [F(3, 14)]);
+    a.flush();
+    const target = outside();
+    fs.writeFileSync(target, "目录外的文件", { mode: 0o644 });
+    fs.chmodSync(target, 0o644);
+    const before = snapshot(target);
+    fs.rmSync(side("-wal"));
+    fs.symlinkSync(target, side("-wal"));
+    a.put("别的文本 号码", [F(0, 2)]);
+    a.flush();
+    expect(snapshot(target)).toBe(before);
+    expect(fs.existsSync(side("-wal")) && fs.lstatSync(side("-wal")).isSymbolicLink()).toBe(false); // 链接已删（只删链接本身）
+    expect(a.getMany(one("手机 13800000000")).size).toBe(0); // 已禁用
+  });
+
+  test("初始化后目录被换成符号链接，再触发损坏重建：禁用，目标目录里的同名文件不被删除", () => {
+    const a = open();
+    const texts = Array.from({ length: 3000 }, (_, i) => `文本号码 ${i} xxxxxxxx`);
+    for (const t of texts) a.put(t, [F(0, 2)]);
+    a.flush();
+    const dir = path.dirname(file);
+    const moved = path.join(root, "moved");
+    const target = path.join(root, "target");
+    fs.mkdirSync(target, { mode: 0o700 });
+    const sentinels = ["finds.sqlite", "finds.sqlite-wal", "finds.sqlite-shm", "finds.sqlite-journal"].map((n) => path.join(target, n));
+    for (const s of sentinels) fs.writeFileSync(s, `目标目录里的 ${path.basename(s)}`);
+    const co = rawDb();
+    co.exec("PRAGMA wal_checkpoint(TRUNCATE)"); // 数据页落回主文件，破坏它才会被读到
+    co.close();
+    fs.renameSync(dir, moved);
+    fs.symlinkSync(target, dir);
+    const movedFile = path.join(moved, "finds.sqlite");
+    const fd = fs.openSync(movedFile, "r+");
+    const size = fs.fstatSync(fd).size;
+    fs.writeSync(fd, Buffer.alloc(size - 4096, 0xab), 0, size - 4096, 4096);
+    fs.closeSync(fd);
+    const msgs: string[] = [];
+    // 目录已是符号链接：新的 openFindCache 自己就拒绝
+    expect(openFindCache({ file, key: () => KEY, revision: "r1", debug: (m) => msgs.push(m) })).toBeUndefined();
+    // 原实例（连接还开着、读到损坏页）触发重建流程
+    const got = a.getMany(new Map(texts.filter((_, i) => i % 7 === 0).map((t) => [sha(t), t])));
+    expect(got.size).toBe(0);
+    for (const s of sentinels) expect(fs.readFileSync(s, "utf8")).toBe(`目标目录里的 ${path.basename(s)}`);
+  });
+
+  test("初始化遇忙期间目录被换掉：重试时发现，禁用，不碰目标目录", async () => {
+    const dir = path.dirname(file);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const other = new Database(file);
+    other.exec("CREATE TABLE x(a)");
+    other.exec("BEGIN EXCLUSIVE");
+    const msgs: string[] = [];
+    const c = openFindCache({ file, key: () => KEY, revision: "r1", debug: (m) => msgs.push(m) });
+    expect(c).toBeDefined();
+    opened.push(c!);
+    const target = path.join(root, "target");
+    fs.mkdirSync(target, { mode: 0o700 });
+    fs.writeFileSync(path.join(target, "finds.sqlite"), "目标目录里的库");
+    other.exec("ROLLBACK");
+    other.close();
+    fs.renameSync(dir, path.join(root, "moved"));
+    fs.symlinkSync(target, dir);
+    await Bun.sleep(1500);
+    expect(msgs.some((m) => m.includes("本进程禁用"))).toBe(true);
+    expect(fs.readdirSync(target)).toEqual(["finds.sqlite"]);
+    expect(fs.readFileSync(path.join(target, "finds.sqlite"), "utf8")).toBe("目标目录里的库");
+  });
+});
