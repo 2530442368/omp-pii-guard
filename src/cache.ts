@@ -144,7 +144,12 @@ function verifyDir(id: DirId): void {
   if (uid !== undefined && st.uid !== uid) throw new Unsafe("缓存目录的属主不是当前用户");
 }
 
-function removeFiles(file: string): void {
+/**
+ * 数据库及侧文件的唯一改动入口之二（另一个是 secureFile，再加 openDb 里的创建与 new Database）：
+ * 动手前先核对目录身份，目录已被换掉就抛 Unsafe、不碰任何文件。
+ */
+function removeFiles(dir: DirId, file: string): void {
+  verifyDir(dir);
   for (const f of [file, `${file}-wal`, `${file}-shm`, `${file}-journal`]) {
     try {
       fs.unlinkSync(f); // 符号链接只删链接本身
@@ -159,7 +164,8 @@ function removeFiles(file: string): void {
  * 符号链接：只删链接本身（`strict` 时删完仍抛 Unsafe：它在数据库已打开之后才出现，说明有人在抢）；
  * 其他非普通文件抛 Unsafe。文件不存在是正常的（-wal/-shm 只在需要时才有）。
  */
-function secureFile(p: string, strict: boolean): void {
+function secureFile(dir: DirId, p: string, strict: boolean): void {
+  verifyDir(dir); // 先核对目录身份：目录被换成指向别处的符号链接时，不能去改目标目录里的同名文件
   let st: fs.Stats;
   try {
     st = fs.lstatSync(p);
@@ -198,7 +204,6 @@ const SIDES = ["-wal", "-shm"] as const;
  * 损坏类问题抛 isCorrupt 为真的错误；忙/锁抛 isBusy 为真的错误（调用方异步退避重试）；不安全抛 Unsafe。
  */
 function openDb(file: string, dir: DirId): Database {
-  verifyDir(dir);
   // 打开前：数据库及侧文件里的符号链接只删链接本身（SQLite 会跟随链接读写）；其余检查与收紧权限。
   let st: fs.Stats | undefined;
   try {
@@ -208,15 +213,17 @@ function openDb(file: string, dir: DirId): Database {
   }
   if (st) {
     if (!st.isFile()) throw new RebuildNeeded("缓存文件不是普通文件");
-    secureFile(file, false);
+    secureFile(dir, file, false);
   } else {
     try {
+      verifyDir(dir);
       fs.writeFileSync(file, "", { flag: "wx", mode: 0o600 }); // 先以 0600 建好，-wal/-shm 继承它的权限
     } catch (e) {
       if (codeOf(e) !== "EEXIST") throw e;
     }
   }
-  for (const s of [...SIDES, "-journal"]) secureFile(file + s, false);
+  for (const s of [...SIDES, "-journal"]) secureFile(dir, file + s, false);
+  verifyDir(dir); // SQLite 按路径打开并可能创建 -wal/-shm
   const db = new Database(file, { create: true, readwrite: true });
   try {
     db.exec(`PRAGMA busy_timeout=${BUSY_MS}`);
@@ -231,8 +238,8 @@ function openDb(file: string, dir: DirId): Database {
       throw new RebuildNeeded("缓存版本不符");
     }
     db.prepare("SELECT h FROM finds LIMIT 1").all(); // 表结构不对或页损坏在这里暴露
-    secureFile(file, true);
-    for (const s of SIDES) secureFile(file + s, true);
+    secureFile(dir, file, true);
+    for (const s of SIDES) secureFile(dir, file + s, true);
     return db;
   } catch (e) {
     try {
@@ -304,8 +311,7 @@ class SqliteFindCache implements FindCache {
         this.debug(`pii-guard 识别缓存损坏，删除重建：${msgOf(e)}`);
         this.rebuilt = true;
         try {
-          verifyDir(this.dir);
-          removeFiles(this.o.file);
+          removeFiles(this.dir, this.o.file);
         } catch (e2) {
           return this.disable(`重建失败：${msgOf(e2)}`);
         }
@@ -418,7 +424,7 @@ class SqliteFindCache implements FindCache {
       this.touched.clear();
       this.failures = 0;
       this.retryAt = 0;
-      for (const s of SIDES) secureFile(this.o.file + s, true); // -wal/-shm 此时才可能新建：核对不是链接、权限 0600
+      for (const s of SIDES) secureFile(this.dir, this.o.file + s, true); // -wal/-shm 此时才可能新建：核对不是链接、权限 0600
     } catch (e) {
       this.count = undefined;
       this.retryAt = Date.now() + FLUSH_MS;
@@ -470,7 +476,7 @@ class SqliteFindCache implements FindCache {
       this.debug(`pii-guard 识别缓存出错（当作未命中）：${msgOf(e)}`);
       if (e instanceof Unsafe) return this.disable(msgOf(e));
       try {
-        if (this.db) for (const s of SIDES) secureFile(this.o.file + s, true); // 出错时顺带核对侧文件（被换成链接时 SQLite 自己也会报 I/O 错误）
+        if (this.db) for (const s of SIDES) secureFile(this.dir, this.o.file + s, true); // 出错时顺带核对侧文件（被换成链接时 SQLite 自己也会报 I/O 错误）
       } catch (e2) {
         return this.disable(msgOf(e2));
       }
@@ -489,8 +495,7 @@ class SqliteFindCache implements FindCache {
     if (this.rebuilt) return this.disable("损坏且已重建过一次");
     this.rebuilt = true;
     try {
-      verifyDir(this.dir);
-      removeFiles(this.o.file);
+      removeFiles(this.dir, this.o.file);
     } catch (e) {
       return this.disable(`重建失败：${msgOf(e)}`);
     }

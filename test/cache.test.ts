@@ -690,34 +690,91 @@ describe("持久识别缓存：侧文件与目录身份", () => {
     expect(a.getMany(one("手机 13800000000")).size).toBe(0); // 已禁用
   });
 
-  test("初始化后目录被换成符号链接，再触发损坏重建：禁用，目标目录里的同名文件不被删除", () => {
+  /** 把缓存目录改名，原路径换成指向 target 的符号链接；target 里放同名的 0644 文件与一个指向目录外文件的同名符号链接。 */
+  function swapDir(): { moved: string; snap: () => string } {
+    const dir = path.dirname(file);
+    const moved = path.join(root, "moved");
+    const target = path.join(root, "target");
+    const elsewhere = path.join(root, "elsewhere");
+    fs.mkdirSync(target, { mode: 0o700 });
+    fs.writeFileSync(elsewhere, "目录外的文件", { mode: 0o644 });
+    fs.chmodSync(elsewhere, 0o644);
+    for (const n of ["finds.sqlite", "finds.sqlite-wal", "finds.sqlite-shm"]) {
+      fs.writeFileSync(path.join(target, n), `目标目录里的 ${n}`);
+      fs.chmodSync(path.join(target, n), 0o644);
+    }
+    fs.symlinkSync(elsewhere, path.join(target, "finds.sqlite-journal"));
+    fs.renameSync(dir, moved);
+    fs.symlinkSync(target, dir);
+    // 目录项、类型、权限、内容（符号链接看指向）一并记下，前后比较
+    const snap = (): string =>
+      [target, elsewhere]
+        .flatMap((root) => {
+          const st = fs.lstatSync(root);
+          if (!st.isDirectory()) return [`${root}|${(st.mode & 0o777).toString(8)}|${fs.readFileSync(root, "utf8")}`];
+          return fs.readdirSync(root).sort().map((n) => {
+            const p = path.join(root, n);
+            const l = fs.lstatSync(p);
+            return `${n}|${l.isSymbolicLink() ? `->${fs.readlinkSync(p)}` : `${(l.mode & 0o777).toString(8)}|${fs.readFileSync(p, "utf8")}`}`;
+          });
+        })
+        .join("\n");
+    return { moved, snap };
+  }
+
+  test("初始化后目录被换成符号链接，再触发损坏重建（fail 路径）：禁用，目标目录里同名文件的权限、内容、目录项都不变", () => {
     const a = open();
     const texts = Array.from({ length: 3000 }, (_, i) => `文本号码 ${i} xxxxxxxx`);
     for (const t of texts) a.put(t, [F(0, 2)]);
     a.flush();
-    const dir = path.dirname(file);
-    const moved = path.join(root, "moved");
-    const target = path.join(root, "target");
-    fs.mkdirSync(target, { mode: 0o700 });
-    const sentinels = ["finds.sqlite", "finds.sqlite-wal", "finds.sqlite-shm", "finds.sqlite-journal"].map((n) => path.join(target, n));
-    for (const s of sentinels) fs.writeFileSync(s, `目标目录里的 ${path.basename(s)}`);
     const co = rawDb();
     co.exec("PRAGMA wal_checkpoint(TRUNCATE)"); // 数据页落回主文件，破坏它才会被读到
     co.close();
-    fs.renameSync(dir, moved);
-    fs.symlinkSync(target, dir);
-    const movedFile = path.join(moved, "finds.sqlite");
-    const fd = fs.openSync(movedFile, "r+");
+    const { moved, snap } = swapDir();
+    const before = snap();
+    const fd = fs.openSync(path.join(moved, "finds.sqlite"), "r+");
     const size = fs.fstatSync(fd).size;
     fs.writeSync(fd, Buffer.alloc(size - 4096, 0xab), 0, size - 4096, 4096);
     fs.closeSync(fd);
     const msgs: string[] = [];
     // 目录已是符号链接：新的 openFindCache 自己就拒绝
     expect(openFindCache({ file, key: () => KEY, revision: "r1", debug: (m) => msgs.push(m) })).toBeUndefined();
-    // 原实例（连接还开着、读到损坏页）触发重建流程
+    // 原实例（连接还开着、读到损坏页）走 fail 路径
     const got = a.getMany(new Map(texts.filter((_, i) => i % 7 === 0).map((t) => [sha(t), t])));
     expect(got.size).toBe(0);
-    for (const s of sentinels) expect(fs.readFileSync(s, "utf8")).toBe(`目标目录里的 ${path.basename(s)}`);
+    expect(snap()).toBe(before);
+    a.put("别的文本 号码", [F(0, 2)]); // 已禁用
+    a.flush();
+    expect(snap()).toBe(before);
+  });
+
+  test("初始化后目录被换成符号链接，flush 成功之后核对侧文件前先核对目录：禁用，目标目录不被改动", () => {
+    const a = open();
+    a.put("手机 13800000000", [F(3, 14)]);
+    a.flush(); // 建好 -wal/-shm
+    const { snap } = swapDir();
+    const before = snap();
+    a.put("别的文本 号码", [F(0, 2)]);
+    a.flush(); // 连接用的是已打开的 fd，写入成功；之后的侧文件核对必须先过目录核对
+    expect(snap()).toBe(before);
+    expect(a.getMany(one("手机 13800000000")).size).toBe(0); // 已禁用
+  });
+
+  test("初始化后目录被换成符号链接，flush 失败（被锁）走 fail：禁用，目标目录不被改动", () => {
+    const a = open();
+    a.put("手机 13800000000", [F(3, 14)]);
+    a.flush();
+    const { moved, snap } = swapDir();
+    const before = snap();
+    const other = new Database(path.join(moved, "finds.sqlite"));
+    other.exec("BEGIN IMMEDIATE");
+    other.exec("INSERT INTO finds VALUES(x'00', '[]', 1)"); // 持有写锁，让 flush 失败
+    a.put("别的文本 号码", [F(0, 2)]);
+    a.flush();
+    other.exec("ROLLBACK");
+    other.close();
+    expect(snap()).toBe(before);
+    expect(a.getMany(one("手机 13800000000")).size).toBe(0); // 已禁用
   });
 
   test("初始化遇忙期间目录被换掉：重试时发现，禁用，不碰目标目录", async () => {
