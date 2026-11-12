@@ -120,6 +120,7 @@ function runtime(): Runtime {
   let slots: GlobalSlots | undefined;
   let slotsOpened = false;
   const lazySlots: GlobalSlots = {
+    background, // Limiter 据此限制本进程里后台任务的进程内名额，与全局后台份额一致
     acquire: async (bg) => {
       if (!slotsOpened) {
         slotsOpened = true;

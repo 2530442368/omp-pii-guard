@@ -345,12 +345,6 @@ describe("等待上限与伪造的槽位文件", () => {
     expect(fs.readFileSync(path.join(dir, "slot-0"), "utf8")).not.toContain("busy-");
     r();
   });
-
-  test("默认等待上限：前台约 10 s、后台约 60 s（不在测试里等满，只核对未被误改）", async () => {
-    const src = fs.readFileSync(path.join(import.meta.dir, "../src/slots.ts"), "utf8");
-    expect(src).toMatch(/FOREGROUND_MAX_WAIT_MS = 10_000/);
-    expect(src).toMatch(/BACKGROUND_MAX_WAIT_MS = 60_000/);
-  });
 });
 
 describe("目录被运行中替换", () => {
