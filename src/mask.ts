@@ -4,6 +4,7 @@
 // 第二层（网络层）遇到时不重复推理。
 
 import { createHash } from "node:crypto";
+import type { FindCache } from "./cache.ts";
 import type { Config } from "./config.ts";
 import { modelSpans, normalizeSpans } from "./filters.ts";
 import type { Recognizer } from "./guard.ts";
@@ -175,6 +176,8 @@ export class Masker implements TextMasker {
     private readonly recognizer: () => Promise<Recognizer>,
     readonly ph: Placeholders,
     private readonly config: () => Config,
+    /** 持久识别缓存（可能还没就绪或已停用，每次用时现取）；它的任何错误都只当作未命中。 */
+    private readonly cache?: () => FindCache | undefined,
   ) {}
 
   /** 配置变了（session_start 重读 config.json 后调用）：重建已知值表，缓存作废。 */
@@ -282,26 +285,55 @@ export class Masker implements TextMasker {
     return res + text.slice(at);
   }
 
-  /** 保证 texts（sha → 文本）都在识别缓存里；推理在后台继续，超过 deadline 抛 MaskTimeout。 */
+  /** 当前可用的持久缓存；取不到或出错一律当作没有。 */
+  private persistent(): FindCache | undefined {
+    try {
+      return this.cache?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 保证 texts（sha → 文本）都在识别缓存里：内存未命中且不在飞行中的先批量查持久缓存，命中的放进内存，
+   * 其余推理（推理完成后写回持久缓存，调用方超时后在后台完成的也写）。超过 deadline 抛 MaskTimeout。
+   */
   private async ensureFinds(texts: ReadonlyMap<string, string>, deadline: number | undefined, background = false): Promise<void> {
     const waits: Promise<unknown>[] = [];
-    let recognizer: Recognizer | undefined;
+    const todo = new Map<string, string>();
     for (const [h, text] of texts) {
       if (this.finds.get(h) !== undefined) continue;
-      let p = this.inflight.get(h);
-      if (!p) {
-        p = (async () => {
-          recognizer ??= await this.recognizer();
-          const r = await recognizer.find(text, background);
-          this.finds.set(h, r, 100 + r.length * 40);
-          return r;
-        })();
-        this.inflight.set(h, p);
-        const clear = (): void => {
-          this.inflight.delete(h);
-        };
-        p.then(clear, clear); // 也吞掉后台失败（调用方超时后没人再等它）
+      const p = this.inflight.get(h);
+      if (p) waits.push(p);
+      else todo.set(h, text);
+    }
+    if (todo.size > 0) {
+      const cache = this.persistent();
+      if (cache) {
+        try {
+          for (const [h, r] of cache.getMany(todo)) {
+            this.finds.set(h, r, 100 + r.length * 40);
+            todo.delete(h);
+          }
+        } catch {} // 缓存出错：当作未命中，照常推理
       }
+    }
+    let recognizer: Recognizer | undefined;
+    for (const [h, text] of todo) {
+      const p = (async () => {
+        recognizer ??= await this.recognizer();
+        const r = await recognizer.find(text, background);
+        this.finds.set(h, r, 100 + r.length * 40);
+        try {
+          this.persistent()?.put(text, r);
+        } catch {}
+        return r;
+      })();
+      this.inflight.set(h, p);
+      const clear = (): void => {
+        this.inflight.delete(h);
+      };
+      p.then(clear, clear); // 也吞掉后台失败（调用方超时后没人再等它）
       waits.push(p);
     }
     if (waits.length === 0) return;
